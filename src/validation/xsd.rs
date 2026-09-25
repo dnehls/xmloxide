@@ -1782,7 +1782,8 @@ fn parse_compositor(
         if let XsdParticle::Element(elem) = &mut particles[0] {
             match compositor_max {
                 MaxOccurs::Bounded(n) if n > 1 => elem.max_occurs = MaxOccurs::Bounded(n),
-                _ => {}
+                MaxOccurs::Unbounded => elem.max_occurs = MaxOccurs::Unbounded,
+                MaxOccurs::Bounded(_) => {}
             }
         }
     }
@@ -5943,6 +5944,36 @@ mod tests {
             &wildcard_doc("<Record><feat><bogus>1</bogus></feat></Record>"),
             false,
         );
+    }
+
+    #[test]
+    fn test_validate_xsd_unbounded_single_element_sequence() {
+        // gml:CurveSegmentArrayPropertyType: the repetition sits on the
+        // sequence, not on the element.
+        let schema = make_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="seg" type="xs:string"/>
+                <xs:complexType name="SegmentsType">
+                    <xs:sequence minOccurs="0" maxOccurs="unbounded">
+                        <xs:element ref="seg"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:element name="segments" type="SegmentsType"/>
+            </xs:schema>"#,
+        );
+        for xml in [
+            "<segments/>",
+            "<segments><seg>1</seg></segments>",
+            "<segments><seg>1</seg><seg>2</seg><seg>3</seg></segments>",
+        ] {
+            let doc = Document::parse_str(xml).unwrap();
+            for result in [
+                validate_xsd(&doc, &schema),
+                validate_xsd_strict(&doc, &schema),
+            ] {
+                assert!(result.is_valid, "{xml}: {:?}", result.errors);
+            }
+        }
     }
 
     // ── Substitution group tests ──────────────────────────────────────────
