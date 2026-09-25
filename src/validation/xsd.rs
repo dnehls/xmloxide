@@ -2821,7 +2821,7 @@ fn validate_complex_element(
         ComplexContent::Empty => validate_empty_content(doc, node, elem_name, ct.mixed, errors),
         ComplexContent::Sequence(p) => {
             let ce = collect_child_elements(doc, node);
-            validate_sequence(doc, &ce, p, elem_name, schema, errors);
+            validate_sequence(doc, &ce, p, elem_name, schema, errors, true);
         }
         ComplexContent::Choice(p) => {
             let ce = collect_child_elements(doc, node);
@@ -2878,7 +2878,11 @@ fn collect_child_elements(doc: &Document, node: NodeId) -> Vec<NodeId> {
         .collect()
 }
 
-/// Validates a sequence content model.
+/// Validates a sequence content model, returning the children consumed.
+///
+/// With `report_unexpected == false` the sequence is a nested group: it
+/// consumes the matching prefix of `children` and leaves the rest to the
+/// enclosing content model instead of reporting it.
 fn validate_sequence(
     doc: &Document,
     children: &[NodeId],
@@ -2886,7 +2890,8 @@ fn validate_sequence(
     parent_name: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
-) {
+    report_unexpected: bool,
+) -> usize {
     let mut idx = 0;
     for (particle_idx, particle) in particles.iter().enumerate() {
         match particle {
@@ -2910,6 +2915,9 @@ fn validate_sequence(
                     let matches_later =
                         matches_later_particle(doc, child, &particles[particle_idx + 1..], schema);
                     if !matches_later {
+                        if !report_unexpected {
+                            break;
+                        }
                         let child_name = doc.node_name(child).unwrap_or("<unknown>");
                         errors.push(ValidationError {
                             message: format!(
@@ -2940,13 +2948,14 @@ fn validate_sequence(
             }
         }
     }
-    if idx < children.len() {
+    if report_unexpected && idx < children.len() {
         let unexpected = doc.node_name(children[idx]).unwrap_or("<unknown>");
         errors.push(ValidationError {
             message: format!("unexpected element <{unexpected}> in <{parent_name}>; not expected by the content model"),
             line: None, column: None,
         });
     }
+    idx
 }
 
 /// Consumes additional occurrences of a sequence element when maxOccurs > 1.
@@ -3255,13 +3264,7 @@ fn validate_group_content(
 ) -> usize {
     match content {
         ComplexContent::Sequence(particles) => {
-            let before = errors.len();
-            validate_sequence(doc, children, particles, parent_name, schema, errors);
-            if errors.len() == before {
-                children.len()
-            } else {
-                0
-            }
+            validate_sequence(doc, children, particles, parent_name, schema, errors, false)
         }
         ComplexContent::Choice(particles) => {
             validate_choice(doc, children, particles, parent_name, schema, errors);
@@ -3386,6 +3389,7 @@ fn validate_choice(
                                     parent_name,
                                     schema,
                                     errors,
+                                    true,
                                 );
                                 return true;
                             }
@@ -5784,6 +5788,42 @@ mod tests {
             r#"<a:item xmlns:a="urn:a"><x>1</x></a:item>"#,
             false,
         );
+    }
+
+    #[test]
+    fn test_validate_xsd_nested_sequence_group_consumes_prefix() {
+        // The group is one particle of the outer sequence: it consumes `a`
+        // and `b`, the outer sequence continues with `c` (the GML pattern
+        // `<group ref="gml:StandardObjectProperties"/>` followed by more).
+        let schema = make_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:group name="g"><xs:sequence>
+                    <xs:element name="a" type="xs:string" minOccurs="0"/>
+                    <xs:element name="b" type="xs:string" minOccurs="0"/>
+                </xs:sequence></xs:group>
+                <xs:complexType name="RootType"><xs:sequence>
+                    <xs:group ref="g"/>
+                    <xs:element name="c" type="xs:string"/>
+                </xs:sequence></xs:complexType>
+                <xs:element name="root" type="RootType"/>
+            </xs:schema>"#,
+        );
+        for xml in [
+            "<root><a>1</a><b>2</b><c>3</c></root>",
+            "<root><b>2</b><c>3</c></root>",
+            "<root><c>3</c></root>",
+        ] {
+            let doc = Document::parse_str(xml).unwrap();
+            for result in [
+                validate_xsd(&doc, &schema),
+                validate_xsd_strict(&doc, &schema),
+            ] {
+                assert!(result.is_valid, "{xml}: {:?}", result.errors);
+            }
+        }
+        let doc = Document::parse_str("<root><a>1</a><c>3</c><b>2</b></root>").unwrap();
+        assert!(!validate_xsd(&doc, &schema).is_valid);
+        assert!(!validate_xsd_strict(&doc, &schema).is_valid);
     }
 
     // ── Substitution group tests ──────────────────────────────────────────
