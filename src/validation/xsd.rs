@@ -177,6 +177,14 @@ pub struct XsdElement {
     /// When present, the element's type is resolved from the referenced
     /// global element declaration rather than from `type_ref` or `inline_type`.
     pub element_ref: Option<String>,
+    /// The namespace name an instance element must carry to match this
+    /// declaration (XSD 1.0 §3.3.2 {target namespace}).
+    ///
+    /// Global declarations carry the target namespace of their schema
+    /// document; local declarations carry it only when qualified (`form`
+    /// or `elementFormDefault`), otherwise `None`; a `ref` carries the
+    /// namespace of the referenced global declaration.
+    pub namespace: Option<String>,
     /// Minimum number of occurrences (default 1 for local elements).
     pub min_occurs: u32,
     /// Maximum number of occurrences (default 1 for local elements).
@@ -349,6 +357,8 @@ pub enum ComplexContent {
 }
 
 /// A particle in a content model -- either an element or a nested group.
+// Boxing `Element` would change the public pattern-matching API.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum XsdParticle {
     /// An element declaration within the content model.
@@ -530,7 +540,7 @@ pub fn parse_xsd_with_options(
     // Use a synthetic key for the top-level schema (it has no schemaLocation)
     loaded.insert("<root>".to_string());
 
-    parse_xsd_internal(schema_xml, options, &mut loaded, &mut schema)?;
+    parse_xsd_internal(schema_xml, options, &mut loaded, &mut schema, None)?;
 
     // Build substitution group index from all element declarations.
     build_substitution_index(&mut schema);
@@ -550,6 +560,7 @@ fn parse_xsd_internal(
     options: &XsdParseOptions<'_>,
     loaded: &mut HashSet<String>,
     schema: &mut XsdSchema,
+    including_ns: Option<&String>,
 ) -> Result<(), ValidationError> {
     let doc = Document::parse_str(schema_xml).map_err(|e| ValidationError {
         message: format!("failed to parse XSD schema XML: {e}"),
@@ -572,14 +583,24 @@ fn parse_xsd_internal(
         });
     }
 
-    let this_ns = doc.attribute(root, "targetNamespace").map(String::from);
+    let own_ns = doc.attribute(root, "targetNamespace").map(String::from);
+    let chameleon = own_ns.is_none() && including_ns.is_some();
+    let this_ns = own_ns.or_else(|| including_ns.cloned());
 
     // Set target_namespace from the first schema we parse (the root)
     if schema.target_namespace.is_none() && this_ns.is_some() {
         schema.target_namespace.clone_from(&this_ns);
     }
 
-    parse_top_level_declarations(&doc, root, schema, options, loaded, this_ns.as_ref())?;
+    parse_top_level_declarations(
+        &doc,
+        root,
+        schema,
+        options,
+        loaded,
+        this_ns.as_ref(),
+        chameleon,
+    )?;
 
     Ok(())
 }
@@ -592,7 +613,10 @@ fn parse_top_level_declarations(
     options: &XsdParseOptions<'_>,
     loaded: &mut HashSet<String>,
     this_ns: Option<&String>,
+    chameleon: bool,
 ) -> Result<(), ValidationError> {
+    let target_ns = this_ns.map(String::as_str).filter(|ns| !ns.is_empty());
+    let qualified = doc.attribute(root, "elementFormDefault") == Some("qualified");
     // Pass 1: collect named model groups so type parsing can resolve <group ref="...">
     for child in doc.children(root) {
         if doc.node_name(child) != Some("group") {
@@ -601,7 +625,13 @@ fn parse_top_level_declarations(
         let Some(group_name) = doc.attribute(child, "name") else {
             continue;
         };
-        if let Some(group_content) = parse_named_group(doc, child, &schema.model_groups) {
+        let ctx = DeclContext {
+            target_ns,
+            chameleon,
+            qualified,
+            group_defs: &schema.model_groups,
+        };
+        if let Some(group_content) = parse_named_group(doc, child, &ctx) {
             schema
                 .model_groups
                 .insert(group_name.to_string(), group_content);
@@ -609,6 +639,12 @@ fn parse_top_level_declarations(
     }
 
     let group_defs = schema.model_groups.clone();
+    let ctx = DeclContext {
+        target_ns,
+        chameleon,
+        qualified,
+        group_defs: &group_defs,
+    };
 
     // Pass 2: parse all regular top-level declarations
     for child in doc.children(root) {
@@ -617,12 +653,12 @@ fn parse_top_level_declarations(
         };
         match name {
             "element" => {
-                if let Some(elem) = parse_element_decl(doc, child) {
+                if let Some(elem) = parse_element_decl(doc, child, &ctx, true) {
                     schema.elements.insert(elem.name.clone(), elem);
                 }
             }
             "complexType" => {
-                let ct = parse_complex_type(doc, child, &group_defs);
+                let ct = parse_complex_type(doc, child, &ctx);
                 if let Some(ref type_name) = ct.name {
                     schema.types.insert(type_name.clone(), XsdType::Complex(ct));
                 }
@@ -729,7 +765,7 @@ fn handle_include(
     }
 
     // Parse and merge the included schema's declarations
-    parse_xsd_internal(&content, options, loaded, schema)?;
+    parse_xsd_internal(&content, options, loaded, schema, this_ns)?;
 
     Ok(())
 }
@@ -850,6 +886,7 @@ fn handle_import(
         options,
         loaded,
         Some(&ns_key),
+        false,
     )?;
 
     // Move non-builtin declarations to the ImportedSchema
@@ -1243,6 +1280,25 @@ fn register_builtin_types(schema: &mut XsdSchema) {
 ///
 /// Handles both named declarations (`name="foo" type="xs:string"`) and
 /// element references (`ref="cbc:ID"`). For references, the `ref` `QName`
+/// Per-document context for parsing declarations.
+///
+/// Carries what a local element declaration needs to know about the schema
+/// document it appears in (XSD 1.0 §3.3.2): the effective target namespace
+/// (the including document's one for a chameleon include) and whether
+/// `elementFormDefault="qualified"` is in effect.
+#[derive(Clone, Copy)]
+struct DeclContext<'a> {
+    /// Effective target namespace of the declaring schema document.
+    target_ns: Option<&'a str>,
+    /// Whether the document has no `targetNamespace` of its own and takes
+    /// the including document's one (chameleon include, XSD 1.0 §4.2.1).
+    chameleon: bool,
+    /// `elementFormDefault="qualified"` on the declaring document.
+    qualified: bool,
+    /// Named model groups visible for `<xs:group ref="...">`.
+    group_defs: &'a HashMap<String, ComplexContent>,
+}
+
 /// Parses an `<xs:any>` element wildcard declaration.
 fn parse_any_wildcard(doc: &Document, node: NodeId) -> XsdAny {
     let namespace_str = doc.attribute(node, "namespace").unwrap_or("##any");
@@ -1281,7 +1337,12 @@ fn parse_any_wildcard(doc: &Document, node: NodeId) -> XsdAny {
 }
 
 /// Parses an `<xs:element>` declaration within a content model. Element refs
-fn parse_element_decl(doc: &Document, node: NodeId) -> Option<XsdElement> {
+fn parse_element_decl(
+    doc: &Document,
+    node: NodeId,
+    ctx: &DeclContext<'_>,
+    global: bool,
+) -> Option<XsdElement> {
     let min_occurs = doc
         .attribute(node, "minOccurs")
         .and_then(|v| v.parse::<u32>().ok())
@@ -1303,11 +1364,20 @@ fn parse_element_decl(doc: &Document, node: NodeId) -> Option<XsdElement> {
         } else {
             ref_qname.to_string()
         };
+        let prefix = ref_qname.split_once(':').map(|(p, _)| p);
+        let namespace = lookup_namespace_uri(doc, node, prefix).or_else(|| {
+            // Chameleon include: unqualified references take the including
+            // document's target namespace.
+            (prefix.is_none() && ctx.chameleon)
+                .then(|| ctx.target_ns.map(String::from))
+                .flatten()
+        });
         return Some(XsdElement {
             name: local_name,
             type_ref: None,
             inline_type: None,
             element_ref: Some(ref_qname.to_string()),
+            namespace,
             min_occurs,
             max_occurs,
             substitution_group: None,
@@ -1317,7 +1387,17 @@ fn parse_element_decl(doc: &Document, node: NodeId) -> Option<XsdElement> {
 
     let name = doc.attribute(node, "name")?.to_string();
     let type_ref = doc.attribute(node, "type").map(strip_xs_prefix);
-    let inline_type = find_inline_type(doc, node);
+    let inline_type = find_inline_type(doc, node, ctx);
+    let qualified = match doc.attribute(node, "form") {
+        Some("qualified") => true,
+        Some("unqualified") => false,
+        _ => ctx.qualified,
+    };
+    let namespace = if global || qualified {
+        ctx.target_ns.map(String::from)
+    } else {
+        None
+    };
     let substitution_group = doc.attribute(node, "substitutionGroup").map(String::from);
     let is_abstract = doc
         .attribute(node, "abstract")
@@ -1327,6 +1407,7 @@ fn parse_element_decl(doc: &Document, node: NodeId) -> Option<XsdElement> {
         type_ref,
         inline_type,
         element_ref: None,
+        namespace,
         min_occurs,
         max_occurs,
         substitution_group,
@@ -1335,18 +1416,23 @@ fn parse_element_decl(doc: &Document, node: NodeId) -> Option<XsdElement> {
 }
 
 /// Looks for an inline `<xs:complexType>` or `<xs:simpleType>` child.
-fn find_inline_type(doc: &Document, node: NodeId) -> Option<XsdType> {
+fn find_inline_type(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> Option<XsdType> {
     for child in doc.children(node) {
         let Some(child_name) = doc.node_name(child) else {
             continue;
         };
         match child_name {
             "complexType" => {
+                let no_groups = HashMap::new();
+                let inline_ctx = DeclContext {
+                    group_defs: &no_groups,
+                    ..*ctx
+                };
                 return Some(XsdType::Complex(parse_complex_type(
                     doc,
                     child,
-                    &HashMap::new(),
-                )))
+                    &inline_ctx,
+                )));
             }
             "simpleType" => {
                 return Some(XsdType::Simple(parse_simple_type(doc, child)));
@@ -1358,11 +1444,7 @@ fn find_inline_type(doc: &Document, node: NodeId) -> Option<XsdType> {
 }
 
 /// Parses an `<xs:complexType>` element.
-fn parse_complex_type(
-    doc: &Document,
-    node: NodeId,
-    group_defs: &HashMap<String, ComplexContent>,
-) -> ComplexType {
+fn parse_complex_type(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> ComplexType {
     let name = doc.attribute(node, "name").map(String::from);
     let mixed = doc.attribute(node, "mixed") == Some("true");
     let mut content = ComplexContent::Empty;
@@ -1375,13 +1457,13 @@ fn parse_complex_type(
         };
         match child_name {
             "sequence" => {
-                content = parse_compositor(doc, child, CompositorKind::Sequence, group_defs);
+                content = parse_compositor(doc, child, CompositorKind::Sequence, ctx);
             }
             "choice" => {
-                content = parse_compositor(doc, child, CompositorKind::Choice, group_defs);
+                content = parse_compositor(doc, child, CompositorKind::Choice, ctx);
             }
             "all" => {
-                content = parse_compositor(doc, child, CompositorKind::All, group_defs);
+                content = parse_compositor(doc, child, CompositorKind::All, ctx);
             }
             "attribute" => {
                 if let Some(attr) = parse_attribute_decl(doc, child) {
@@ -1408,7 +1490,7 @@ fn parse_complex_type(
                 collect_simple_content_attributes(doc, child, &mut attributes);
             }
             "complexContent" => {
-                let (base, ct, ext_attrs) = parse_complex_content(doc, child, group_defs);
+                let (base, ct, ext_attrs) = parse_complex_content(doc, child, ctx);
                 extension_base = base;
                 content = ct;
                 attributes.extend(ext_attrs);
@@ -1434,7 +1516,7 @@ fn parse_complex_type(
 fn parse_complex_content(
     doc: &Document,
     cc_node: NodeId,
-    group_defs: &HashMap<String, ComplexContent>,
+    ctx: &DeclContext<'_>,
 ) -> (Option<String>, ComplexContent, Vec<XsdAttribute>) {
     let mut base = None;
     let mut content = ComplexContent::Empty;
@@ -1453,24 +1535,14 @@ fn parse_complex_content(
                     };
                     match ext_name {
                         "sequence" => {
-                            content = parse_compositor(
-                                doc,
-                                ext_child,
-                                CompositorKind::Sequence,
-                                group_defs,
-                            );
+                            content =
+                                parse_compositor(doc, ext_child, CompositorKind::Sequence, ctx);
                         }
                         "choice" => {
-                            content = parse_compositor(
-                                doc,
-                                ext_child,
-                                CompositorKind::Choice,
-                                group_defs,
-                            );
+                            content = parse_compositor(doc, ext_child, CompositorKind::Choice, ctx);
                         }
                         "all" => {
-                            content =
-                                parse_compositor(doc, ext_child, CompositorKind::All, group_defs);
+                            content = parse_compositor(doc, ext_child, CompositorKind::All, ctx);
                         }
                         "attribute" => {
                             if let Some(attr) = parse_attribute_decl(doc, ext_child) {
@@ -1505,24 +1577,15 @@ fn parse_complex_content(
                     };
                     match restr_name {
                         "sequence" => {
-                            content = parse_compositor(
-                                doc,
-                                restr_child,
-                                CompositorKind::Sequence,
-                                group_defs,
-                            );
+                            content =
+                                parse_compositor(doc, restr_child, CompositorKind::Sequence, ctx);
                         }
                         "choice" => {
-                            content = parse_compositor(
-                                doc,
-                                restr_child,
-                                CompositorKind::Choice,
-                                group_defs,
-                            );
+                            content =
+                                parse_compositor(doc, restr_child, CompositorKind::Choice, ctx);
                         }
                         "all" => {
-                            content =
-                                parse_compositor(doc, restr_child, CompositorKind::All, group_defs);
+                            content = parse_compositor(doc, restr_child, CompositorKind::All, ctx);
                         }
                         "attribute" => {
                             if let Some(attr) = parse_attribute_decl(doc, restr_child) {
@@ -1606,7 +1669,7 @@ enum CompositorKind {
 fn parse_named_group(
     doc: &Document,
     node: NodeId,
-    group_defs: &HashMap<String, ComplexContent>,
+    ctx: &DeclContext<'_>,
 ) -> Option<ComplexContent> {
     for child in doc.children(node) {
         let Some(name) = doc.node_name(child) else {
@@ -1614,28 +1677,13 @@ fn parse_named_group(
         };
         match name {
             "sequence" => {
-                return Some(parse_compositor(
-                    doc,
-                    child,
-                    CompositorKind::Sequence,
-                    group_defs,
-                ));
+                return Some(parse_compositor(doc, child, CompositorKind::Sequence, ctx));
             }
             "choice" => {
-                return Some(parse_compositor(
-                    doc,
-                    child,
-                    CompositorKind::Choice,
-                    group_defs,
-                ));
+                return Some(parse_compositor(doc, child, CompositorKind::Choice, ctx));
             }
             "all" => {
-                return Some(parse_compositor(
-                    doc,
-                    child,
-                    CompositorKind::All,
-                    group_defs,
-                ));
+                return Some(parse_compositor(doc, child, CompositorKind::All, ctx));
             }
             _ => {}
         }
@@ -1648,7 +1696,7 @@ fn parse_compositor(
     doc: &Document,
     node: NodeId,
     kind: CompositorKind,
-    group_defs: &HashMap<String, ComplexContent>,
+    ctx: &DeclContext<'_>,
 ) -> ComplexContent {
     let mut particles = Vec::new();
     // Read compositor-level minOccurs/maxOccurs.
@@ -1671,7 +1719,7 @@ fn parse_compositor(
         };
         match child_name {
             "element" => {
-                if let Some(mut elem) = parse_element_decl(doc, child) {
+                if let Some(mut elem) = parse_element_decl(doc, child, ctx, false) {
                     // If the compositor itself is optional (minOccurs=0),
                     // propagate that to element children so the validator
                     // doesn't require them.
@@ -1686,7 +1734,7 @@ fn parse_compositor(
                     doc,
                     child,
                     CompositorKind::Sequence,
-                    group_defs,
+                    ctx,
                 )));
             }
             "choice" => {
@@ -1694,7 +1742,7 @@ fn parse_compositor(
                     doc,
                     child,
                     CompositorKind::Choice,
-                    group_defs,
+                    ctx,
                 )));
             }
             "all" => {
@@ -1702,7 +1750,7 @@ fn parse_compositor(
                     doc,
                     child,
                     CompositorKind::All,
-                    group_defs,
+                    ctx,
                 )));
             }
             "group" => {
@@ -1712,7 +1760,7 @@ fn parse_compositor(
                     } else {
                         ref_qname
                     };
-                    if let Some(group_content) = group_defs.get(local) {
+                    if let Some(group_content) = ctx.group_defs.get(local) {
                         particles.push(XsdParticle::Group(group_content.clone()));
                     }
                 }
@@ -1946,6 +1994,26 @@ fn build_prefix_map(doc: &Document, node: NodeId) -> HashMap<String, String> {
     map
 }
 
+/// Resolves `prefix` (or the default namespace for `None`) to its namespace
+/// URI using the declarations in scope at `node`.
+fn lookup_namespace_uri(doc: &Document, node: NodeId, prefix: Option<&str>) -> Option<String> {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        for attr in doc.attributes(id) {
+            let declares = match prefix {
+                Some(p) => attr.prefix.as_deref() == Some("xmlns") && attr.name == p,
+                None => attr.prefix.is_none() && attr.name == "xmlns",
+            };
+            if declares {
+                // `xmlns=""` undeclares the default namespace.
+                return (!attr.value.is_empty()).then(|| attr.value.clone());
+            }
+        }
+        current = doc.parent(id);
+    }
+    None
+}
+
 /// Resolves a `QName` type reference into a namespace URI and local name.
 ///
 /// Given a type reference like `"xs:string"` or `"tns:AddressType"`, splits
@@ -2068,9 +2136,7 @@ pub fn validate_xsd(doc: &Document, schema: &XsdSchema) -> ValidationResult {
         };
     };
     let root_name = doc.node_name(root).unwrap_or("");
-    if let Some(decl) = schema.elements.get(root_name) {
-        validate_element(doc, root, decl, schema, &mut errors);
-    } else if let Some(decl) = find_root_element_in_imports(root_name, schema) {
+    if let Some(decl) = find_global_element(schema, doc.node_namespace(root), root_name) {
         validate_element(doc, root, decl, schema, &mut errors);
     } else {
         errors.push(ValidationError {
@@ -2129,9 +2195,7 @@ pub fn validate_xsd_strict(doc: &Document, schema: &XsdSchema) -> ValidationResu
         };
     };
     let root_name = doc.node_name(root).unwrap_or("");
-    if let Some(decl) = schema.elements.get(root_name) {
-        validate_element_strict(doc, root, decl, schema, &mut errors);
-    } else if let Some(decl) = find_root_element_in_imports(root_name, schema) {
+    if let Some(decl) = find_global_element(schema, doc.node_namespace(root), root_name) {
         validate_element_strict(doc, root, decl, schema, &mut errors);
     } else {
         errors.push(ValidationError {
@@ -2195,11 +2259,11 @@ pub fn validate_element_strict(
 /// declares neither a type nor an inline type, i.e. has the anyType
 /// definition. An unresolvable `ref` does not count as anyType.
 fn declares_any_type(decl: &XsdElement, schema: &XsdSchema) -> bool {
-    match decl.element_ref {
-        Some(ref ref_qname) => resolve_element_ref(ref_qname, schema)
-            .is_some_and(|target| target.type_ref.is_none() && target.inline_type.is_none()),
-        None => decl.type_ref.is_none() && decl.inline_type.is_none(),
+    if decl.element_ref.is_some() {
+        return resolve_ref_target(decl, schema)
+            .is_some_and(|target| target.type_ref.is_none() && target.inline_type.is_none());
     }
+    decl.type_ref.is_none() && decl.inline_type.is_none()
 }
 
 /// Deep validation fallback: when an element has no resolved type (anyType,
@@ -2219,8 +2283,8 @@ fn validate_children_by_schema_lookup(
         // Only attempt lookup for elements in the schema's target namespace
         // or elements with no namespace (unqualified).
         let child_ns = doc.node_namespace(child).unwrap_or("");
-        let in_schema_ns = schema.target_namespace.as_deref() == Some(child_ns)
-            || child_ns.is_empty();
+        let in_schema_ns =
+            schema.target_namespace.as_deref() == Some(child_ns) || child_ns.is_empty();
         if !in_schema_ns {
             continue;
         }
@@ -2377,24 +2441,6 @@ fn validate_complex_element_strict(
     }
 }
 
-/// Resolve effective declaration for substitution-group matches.
-fn resolve_substitution_member_decl<'a>(
-    doc: &Document,
-    child: NodeId,
-    decl: &'a XsdElement,
-    schema: &'a XsdSchema,
-) -> &'a XsdElement {
-    let child_name = doc.node_name(child).unwrap_or("");
-    if child_name == decl.name {
-        return decl;
-    }
-    schema
-        .elements
-        .get(child_name)
-        .or_else(|| find_root_element_in_imports(child_name, schema))
-        .unwrap_or(decl)
-}
-
 /// Strict sequence validation: uses strict any-wildcard validation.
 fn validate_sequence_strict(
     doc: &Document,
@@ -2413,13 +2459,10 @@ fn validate_sequence_strict(
         match &particles[pidx] {
             XsdParticle::Element(decl) => {
                 if element_matches_decl(doc, children[idx], decl, schema) {
-                    let effective =
-                        resolve_substitution_member_decl(doc, children[idx], decl, schema);
+                    let effective = effective_decl(doc, children[idx], decl, schema);
                     validate_element_strict(doc, children[idx], effective, schema, errors);
                     idx += 1;
-                    handle_repeat_occurrences_strict(
-                        doc, children, &mut idx, decl, schema, errors,
-                    );
+                    handle_repeat_occurrences_strict(doc, children, &mut idx, decl, schema, errors);
                     pidx += 1;
                 } else {
                     let child = children[idx];
@@ -2685,11 +2728,9 @@ fn validate_element(
 /// element declaration and returns its type.
 fn resolve_element_type<'a>(decl: &'a XsdElement, schema: &'a XsdSchema) -> Option<&'a XsdType> {
     // Handle element ref — look up the referenced global element's type
-    if let Some(ref ref_qname) = decl.element_ref {
-        if let Some(ref_decl) = resolve_element_ref(ref_qname, schema) {
-            return resolve_element_type(ref_decl, schema);
-        }
-        return None;
+    if decl.element_ref.is_some() {
+        return resolve_ref_target(decl, schema)
+            .and_then(|ref_decl| resolve_element_type(ref_decl, schema));
     }
     if let Some(ref inline) = decl.inline_type {
         return Some(inline);
@@ -2919,22 +2960,16 @@ fn handle_repeat_occurrences_strict(
 ) {
     if let MaxOccurs::Bounded(max) = decl.max_occurs {
         for _ in 1..max {
-            if *idx >= children.len()
-                || !element_matches_decl(doc, children[*idx], decl, schema)
-            {
+            if *idx >= children.len() || !element_matches_decl(doc, children[*idx], decl, schema) {
                 break;
             }
-            let effective =
-                resolve_substitution_member_decl(doc, children[*idx], decl, schema);
+            let effective = effective_decl(doc, children[*idx], decl, schema);
             validate_element_strict(doc, children[*idx], effective, schema, errors);
             *idx += 1;
         }
     } else {
-        while *idx < children.len()
-            && element_matches_decl(doc, children[*idx], decl, schema)
-        {
-            let effective =
-                resolve_substitution_member_decl(doc, children[*idx], decl, schema);
+        while *idx < children.len() && element_matches_decl(doc, children[*idx], decl, schema) {
+            let effective = effective_decl(doc, children[*idx], decl, schema);
             validate_element_strict(doc, children[*idx], effective, schema, errors);
             *idx += 1;
         }
@@ -3067,13 +3102,12 @@ fn matches_later_group(
     }
 }
 
-/// Validates a single element particle in a sequence, returning number consumed.
-/// Checks if an instance element matches a schema element declaration,
-/// accounting for `elementFormDefault` and element-level `form` attributes.
+/// Checks if an instance element matches a schema element declaration.
 ///
-/// When qualified form is in effect, the element must have the schema's
-/// target namespace. When unqualified, the element is matched by local
-/// name only (no namespace required).
+/// Per XSD 1.0 §3.3.4 (Element Locally Valid) the instance element must
+/// carry the declaration's local name and its {target namespace}
+/// ([`XsdElement::namespace`]), or be a member of the substitution group
+/// headed by the declaration.
 fn element_matches_decl(
     doc: &Document,
     node: NodeId,
@@ -3081,89 +3115,55 @@ fn element_matches_decl(
     schema: &XsdSchema,
 ) -> bool {
     let child_name = doc.node_name(node).unwrap_or("");
-    let child_ns = doc.node_namespace(node).unwrap_or("");
-
-    if child_name != decl.name {
-        // Check substitution groups: if the instance element is a member
-        // of the substitution group headed by `decl`, it is a valid substitute.
-        if is_substitution_member(child_name, decl, schema) {
-            return true;
-        }
-        return false;
+    let child_ns = doc.node_namespace(node).filter(|ns| !ns.is_empty());
+    if child_name == decl.name && child_ns == decl.namespace.as_deref() {
+        return true;
     }
-    // Local names match. Verify namespace compatibility.
-    //
-    // If the declaration is an element ref (e.g., ref="wfs:FeatureCollection"),
-    // resolve the referenced element and check its namespace. The child
-    // element's namespace must match the referenced element's namespace,
-    // not the main schema's targetNamespace.
-    let expected_ns: Option<String> = if let Some(ref ref_qname) = decl.element_ref {
-        // Resolve the ref to find which namespace the element lives in
-        if let Some(_ref_elem) = resolve_element_ref(ref_qname, schema) {
-            // The ref might point to an imported namespace — find it
-            resolve_element_namespace(ref_qname, schema)
-        } else {
-            schema.target_namespace.clone()
-        }
-    } else {
-        // For direct element declarations, use the main schema's targetNamespace
-        // when elementFormDefault=qualified
-        if schema.element_form_default == FormDefault::Qualified {
-            schema.target_namespace.clone()
-        } else {
-            None // No namespace enforcement
-        }
-    };
-
-    match expected_ns {
-        Some(ref ns) => {
-            // When an element_ref points to an imported namespace but the
-            // child element has no namespace prefix (unqualified XML), accept it.
-            // This handles XSD patterns where imported elements are used
-            // without namespace qualification.
-            if child_ns.is_empty() && decl.element_ref.is_some() {
-                return true;
-            }
-            // For local element declarations (no ref), allow if the child
-            // namespace matches any imported schema's namespace.
-            // Local elements inherit their namespace from the type's schema.
-            if decl.element_ref.is_none() {
-                let imported_ns_match = schema
-                    .imported_namespaces
-                    .keys()
-                    .any(|imp_ns| child_ns == imp_ns.as_str());
-                let main_ns_match = child_ns == ns.as_str();
-                return imported_ns_match || main_ns_match;
-            }
-            child_ns == ns.as_str()
-        }
-        None => true,
-    }
+    // A substitution group member is a global declaration, so it must exist
+    // under the child's own namespace.
+    is_substitution_member(child_name, decl, schema)
+        && find_global_element(schema, child_ns, child_name).is_some()
 }
 
-/// Resolves the namespace URI for an element referenced by `QName`.
-fn resolve_element_namespace(ref_qname: &str, schema: &XsdSchema) -> Option<String> {
-    let Some((ns_prefix, local)) = ref_qname.split_once(':') else {
-        return schema.target_namespace.clone();
-    };
-    // Look up prefix in the main schema's prefix map
-    if let Some(ns_uri) = schema.prefix_map.get(ns_prefix) {
-        return Some(ns_uri.clone());
+/// Looks up the global element declaration `{ns}local` in the schema's own
+/// target namespace or in the imported namespace `ns`.
+fn find_global_element<'a>(
+    schema: &'a XsdSchema,
+    ns: Option<&str>,
+    local: &str,
+) -> Option<&'a XsdElement> {
+    let ns = ns.filter(|n| !n.is_empty());
+    if ns == schema.target_namespace.as_deref() {
+        return schema.elements.get(local);
     }
-    // Fallback: check prefix maps of imported schemas (includes that
-    // declare xmlns bindings not present in the root schema document).
-    for imported in schema.imported_namespaces.values() {
-        if let Some(ns_uri) = imported.prefix_map.get(ns_prefix) {
-            return Some(ns_uri.clone());
-        }
+    schema
+        .imported_namespaces
+        .get(ns.unwrap_or(""))
+        .and_then(|imported| imported.elements.get(local))
+}
+
+/// Returns the global element declaration an instance element validates
+/// against when it matched `decl` (itself or a substitution group member).
+fn effective_decl<'a>(
+    doc: &Document,
+    node: NodeId,
+    decl: &'a XsdElement,
+    schema: &'a XsdSchema,
+) -> &'a XsdElement {
+    let child_name = doc.node_name(node).unwrap_or("");
+    if child_name == decl.name {
+        return decl;
     }
-    // Last resort: infer namespace from imported schemas that declare the element.
-    for (ns_uri, imported) in &schema.imported_namespaces {
-        if imported.elements.contains_key(local) {
-            return Some(ns_uri.clone());
-        }
-    }
-    schema.target_namespace.clone()
+    find_global_element(schema, doc.node_namespace(node), child_name).unwrap_or(decl)
+}
+
+/// Resolves the global declaration a `ref` particle points to, preferring
+/// the namespace-qualified lookup over prefix resolution against the root
+/// schema document.
+fn resolve_ref_target<'a>(decl: &XsdElement, schema: &'a XsdSchema) -> Option<&'a XsdElement> {
+    let ref_qname = decl.element_ref.as_deref()?;
+    find_global_element(schema, decl.namespace.as_deref(), &decl.name)
+        .or_else(|| resolve_element_ref(ref_qname, schema))
 }
 
 /// Checks whether `child_name` is a member of the substitution group
@@ -3197,6 +3197,7 @@ fn is_substitution_member(child_name: &str, decl: &XsdElement, schema: &XsdSchem
     false
 }
 
+/// Validates a single element particle in a sequence, returning number consumed.
 fn validate_sequence_element(
     doc: &Document,
     children: &[NodeId],
@@ -3220,18 +3221,13 @@ fn validate_sequence_element(
         // When substitution groups are involved, the instance element may
         // differ from the schema declaration; we need the instance element's
         // own type for correct content validation.
-        let child_name = doc.node_name(child).unwrap_or("");
-        let effective_decl = if child_name == decl.name {
-            decl
-        } else {
-            schema
-                .elements
-                .get(child_name)
-                .map(|d| d as &XsdElement)
-                .or_else(|| find_root_element_in_imports(child_name, schema))
-                .unwrap_or(decl)
-        };
-        validate_element(doc, child, effective_decl, schema, errors);
+        validate_element(
+            doc,
+            child,
+            effective_decl(doc, child, decl, schema),
+            schema,
+            errors,
+        );
         count += 1;
         consumed += 1;
     }
@@ -5478,12 +5474,19 @@ mod tests {
         )
         .unwrap();
 
-        let doc = Document::parse_str("<Order><ID>ORD-1</ID><Name>Test</Name></Order>").unwrap();
+        // A ref takes the namespace of the referenced global declaration.
+        let doc = Document::parse_str(
+            r#"<Order xmlns:cbc="http://example.com/components"><cbc:ID>ORD-1</cbc:ID><cbc:Name>Test</cbc:Name></Order>"#,
+        )
+        .unwrap();
         let result = validate_xsd(&doc, &schema);
         assert!(result.is_valid, "errors: {:?}", result.errors);
 
         // Valid without optional Name
-        let doc2 = Document::parse_str("<Order><ID>ORD-2</ID></Order>").unwrap();
+        let doc2 = Document::parse_str(
+            r#"<Order xmlns:cbc="http://example.com/components"><cbc:ID>ORD-2</cbc:ID></Order>"#,
+        )
+        .unwrap();
         let result2 = validate_xsd(&doc2, &schema);
         assert!(result2.is_valid, "errors: {:?}", result2.errors);
 
@@ -5491,6 +5494,11 @@ mod tests {
         let doc3 = Document::parse_str("<Order><Wrong>X</Wrong></Order>").unwrap();
         let result3 = validate_xsd(&doc3, &schema);
         assert!(!result3.is_valid);
+
+        // Invalid: right local name, but not in the referenced namespace
+        let doc4 = Document::parse_str("<Order><ID>ORD-4</ID></Order>").unwrap();
+        let result4 = validate_xsd(&doc4, &schema);
+        assert!(!result4.is_valid);
     }
 
     #[test]
@@ -5634,6 +5642,147 @@ mod tests {
             1,
             "one defect, one error: {:?}",
             result.errors
+        );
+    }
+
+    /// Main schema `urn:a` importing `urn:b`, both `elementFormDefault="qualified"`.
+    fn two_namespace_schema() -> XsdSchema {
+        let resolver = make_resolver(vec![(
+            "b.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="urn:b" elementFormDefault="qualified">
+                <xs:element name="item">
+                    <xs:complexType><xs:sequence>
+                        <xs:element name="x" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:b="urn:b" targetNamespace="urn:a"
+                        elementFormDefault="qualified">
+                <xs:import namespace="urn:b" schemaLocation="b.xsd"/>
+                <xs:element name="root">
+                    <xs:complexType><xs:sequence>
+                        <xs:element name="own" type="xs:string"/>
+                        <xs:element ref="b:item"/>
+                        <xs:element name="plain" type="xs:string" form="unqualified"
+                                    minOccurs="0"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap()
+    }
+
+    fn assert_both_modes(schema: &XsdSchema, xml: &str, valid: bool) {
+        let doc = Document::parse_str(xml).unwrap();
+        for (mode, result) in [
+            ("lax", validate_xsd(&doc, schema)),
+            ("strict", validate_xsd_strict(&doc, schema)),
+        ] {
+            assert_eq!(
+                result.is_valid, valid,
+                "{mode} validation of {xml}: {:?}",
+                result.errors
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_xsd_local_element_namespaces_valid() {
+        assert_both_modes(
+            &two_namespace_schema(),
+            r#"<root xmlns="urn:a" xmlns:b="urn:b"><own>1</own><b:item><b:x>1</b:x></b:item><plain xmlns="">1</plain></root>"#,
+            true,
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_imported_local_element_in_main_namespace() {
+        // `x` is declared locally in urn:b's schema, so it is {urn:b}x.
+        assert_both_modes(
+            &two_namespace_schema(),
+            r#"<root xmlns="urn:a" xmlns:b="urn:b"><own>1</own><b:item><x>1</x></b:item></root>"#,
+            false,
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_main_local_element_in_imported_namespace() {
+        // `own` is declared locally in urn:a's schema, so it is {urn:a}own.
+        assert_both_modes(
+            &two_namespace_schema(),
+            r#"<root xmlns="urn:a" xmlns:b="urn:b"><b:own>1</b:own><b:item><b:x>1</b:x></b:item></root>"#,
+            false,
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_form_unqualified_overrides_default() {
+        // form="unqualified" puts `plain` in no namespace despite
+        // elementFormDefault="qualified".
+        assert_both_modes(
+            &two_namespace_schema(),
+            r#"<root xmlns="urn:a" xmlns:b="urn:b"><own>1</own><b:item><b:x>1</b:x></b:item><plain>1</plain></root>"#,
+            false,
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_unqualified_local_element_with_namespace() {
+        let schema = make_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="urn:example">
+                <xs:element name="order">
+                    <xs:complexType><xs:sequence>
+                        <xs:element name="item" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        assert_both_modes(
+            &schema,
+            r#"<order xmlns="urn:example"><item>Widget</item></order>"#,
+            false,
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_chameleon_include_takes_including_namespace() {
+        let resolver = make_resolver(vec![(
+            "types.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        elementFormDefault="qualified">
+                <xs:complexType name="ItemType"><xs:sequence>
+                    <xs:element name="x" type="xs:string"/>
+                </xs:sequence></xs:complexType>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:a="urn:a" targetNamespace="urn:a">
+                <xs:include schemaLocation="types.xsd"/>
+                <xs:element name="item" type="a:ItemType"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+        assert_both_modes(&schema, r#"<item xmlns="urn:a"><x>1</x></item>"#, true);
+        assert_both_modes(
+            &schema,
+            r#"<a:item xmlns:a="urn:a"><x>1</x></a:item>"#,
+            false,
         );
     }
 
@@ -6300,7 +6449,8 @@ fn test_gml_style_optional_sequence_ref() {
     let schema = parse_xsd(
         r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
                    xmlns:gml="http://example.com/gml"
-                   targetNamespace="http://example.com/gml">
+                   targetNamespace="http://example.com/gml"
+                   elementFormDefault="qualified">
             <xs:element name="AbstractCRS" type="xs:string" abstract="true"/>
             <xs:element name="GeodeticCRS" substitutionGroup="gml:AbstractCRS" type="xs:string"/>
             <xs:complexType name="CRSPropertyType">
@@ -6353,7 +6503,8 @@ mod test_envelope_lowercorner {
         let schema = parse_xsd(
             r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
                    xmlns:gml="http://example.com/gml"
-                   targetNamespace="http://example.com/gml">
+                   targetNamespace="http://example.com/gml"
+                   elementFormDefault="qualified">
                 <xs:complexType name="EnvelopeType">
                     <xs:choice>
                         <xs:sequence>

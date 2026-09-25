@@ -643,9 +643,9 @@ fn test_xsd_import_include_ubl_like_pattern() {
     // Parse the main schema (follows imports and includes)
     let schema = parse_xsd_with_options(main_order_xsd, &opts).unwrap();
 
-    // Validate a valid document
-    let xml =
-        "<Order><ID>ORD-001</ID><Item><name>Widget</name><quantity>10</quantity></Item></Order>";
+    // Validate a valid document: the global Order is in the target
+    // namespace, its local elements are unqualified.
+    let xml = r#"<ord:Order xmlns:ord="urn:oasis:names:tc:ubl:Order-2"><ID>ORD-001</ID><Item><name>Widget</name><quantity>10</quantity></Item></ord:Order>"#;
     let doc = Document::parse_str(xml).unwrap();
     let result = validate_xsd(&doc, &schema);
     assert!(
@@ -655,7 +655,7 @@ fn test_xsd_import_include_ubl_like_pattern() {
     );
 
     // Validate an invalid document (wrong child elements)
-    let bad_xml = "<Order><ID>ORD-002</ID><Item><wrong>X</wrong></Item></Order>";
+    let bad_xml = r#"<ord:Order xmlns:ord="urn:oasis:names:tc:ubl:Order-2"><ID>ORD-002</ID><Item><wrong>X</wrong></Item></ord:Order>"#;
     let bad_doc = Document::parse_str(bad_xml).unwrap();
     let bad_result = validate_xsd(&bad_doc, &schema);
     assert!(
