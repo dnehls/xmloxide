@@ -380,6 +380,9 @@ pub struct XsdAny {
     pub min_occurs: u32,
     /// Maximum occurrences.
     pub max_occurs: MaxOccurs,
+    /// Target namespace of the schema document declaring the wildcard, which
+    /// `##other` and `##targetNamespace` refer to (XSD 1.0 §3.10.2).
+    pub target_namespace: Option<String>,
 }
 
 /// Namespace constraint for `<xsd:any>`.
@@ -1300,7 +1303,7 @@ struct DeclContext<'a> {
 }
 
 /// Parses an `<xs:any>` element wildcard declaration.
-fn parse_any_wildcard(doc: &Document, node: NodeId) -> XsdAny {
+fn parse_any_wildcard(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> XsdAny {
     let namespace_str = doc.attribute(node, "namespace").unwrap_or("##any");
     let namespace = match namespace_str {
         "##any" => XsdAnyNamespace::Any,
@@ -1333,6 +1336,7 @@ fn parse_any_wildcard(doc: &Document, node: NodeId) -> XsdAny {
         process_contents,
         min_occurs,
         max_occurs,
+        target_namespace: ctx.target_ns.map(String::from),
     }
 }
 
@@ -1766,7 +1770,7 @@ fn parse_compositor(
                 }
             }
             "any" => {
-                let any = parse_any_wildcard(doc, child);
+                let any = parse_any_wildcard(doc, child, ctx);
                 particles.push(XsdParticle::Any(any));
             }
             _ => {}
@@ -2248,9 +2252,8 @@ pub fn validate_element_strict(
                     column: None,
                 });
             }
-            // Content of an element without a usable type is assessed laxly:
-            // children with a global declaration are validated against it.
-            validate_children_by_schema_lookup(doc, node, schema, errors);
+            // Content of an element without a usable type is assessed laxly.
+            validate_children_laxly(doc, node, schema, errors, true);
         }
     }
 }
@@ -2264,35 +2267,6 @@ fn declares_any_type(decl: &XsdElement, schema: &XsdSchema) -> bool {
             .is_some_and(|target| target.type_ref.is_none() && target.inline_type.is_none());
     }
     decl.type_ref.is_none() && decl.inline_type.is_none()
-}
-
-/// Deep validation fallback: when an element has no resolved type (anyType,
-/// or a type unknown to the schema), validate each of its children
-/// by looking them up as global element declarations in the schema.
-/// This enables validation of AAA feature elements nested inside WFS/GML
-/// wrapper elements whose types are unknown to the AAA schema.
-fn validate_children_by_schema_lookup(
-    doc: &Document,
-    node: NodeId,
-    schema: &XsdSchema,
-    errors: &mut Vec<ValidationError>,
-) {
-    let ce = collect_child_elements(doc, node);
-    for child in ce {
-        let child_name = doc.node_name(child).unwrap_or("");
-        // Only attempt lookup for elements in the schema's target namespace
-        // or elements with no namespace (unqualified).
-        let child_ns = doc.node_namespace(child).unwrap_or("");
-        let in_schema_ns =
-            schema.target_namespace.as_deref() == Some(child_ns) || child_ns.is_empty();
-        if !in_schema_ns {
-            continue;
-        }
-        // Look up as global element declaration
-        if let Some(child_decl) = schema.elements.get(child_name) {
-            validate_element_strict(doc, child, child_decl, schema, errors);
-        }
-    }
 }
 
 fn resolve_simple_content_base_attributes(
@@ -2392,13 +2366,11 @@ fn validate_complex_element_strict(
         }
         ComplexContent::Sequence(p) => {
             let ce = collect_child_elements(doc, node);
-            let owner_ns = doc.node_namespace(node).unwrap_or("");
             let _ = validate_sequence_strict(
                 doc,
                 &ce,
                 p,
                 doc.node_name(node).unwrap_or("<unknown>"),
-                owner_ns,
                 schema,
                 errors,
                 true,
@@ -2413,6 +2385,7 @@ fn validate_complex_element_strict(
                 doc.node_name(node).unwrap_or("<unknown>"),
                 schema,
                 errors,
+                true,
             );
         }
         ComplexContent::All(p) => {
@@ -2447,7 +2420,6 @@ fn validate_sequence_strict(
     children: &[NodeId],
     particles: &[XsdParticle],
     parent_name: &str,
-    owner_ns: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
     report_unexpected: bool,
@@ -2528,7 +2500,6 @@ fn validate_sequence_strict(
                     &children[idx..],
                     content,
                     parent_name,
-                    owner_ns,
                     schema,
                     errors,
                 );
@@ -2541,7 +2512,6 @@ fn validate_sequence_strict(
                     &children[idx..],
                     any,
                     parent_name,
-                    owner_ns,
                     schema,
                     errors,
                 );
@@ -2570,23 +2540,15 @@ fn validate_group_content_strict(
     children: &[NodeId],
     content: &ComplexContent,
     parent_name: &str,
-    owner_ns: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
 ) -> usize {
     match content {
-        ComplexContent::Sequence(particles) => validate_sequence_strict(
-            doc,
-            children,
-            particles,
-            parent_name,
-            owner_ns,
-            schema,
-            errors,
-            false,
-        ),
+        ComplexContent::Sequence(particles) => {
+            validate_sequence_strict(doc, children, particles, parent_name, schema, errors, false)
+        }
         ComplexContent::Choice(particles) => {
-            validate_choice(doc, children, particles, parent_name, schema, errors);
+            validate_choice(doc, children, particles, parent_name, schema, errors, true);
             children.len()
         }
         ComplexContent::All(particles) => {
@@ -2599,111 +2561,17 @@ fn validate_group_content_strict(
 
 /// Strict `<xsd:any>` wildcard validation.
 ///
-/// Unlike the lax version, this actually attempts to resolve element
-/// declarations for `processContents="strict"` and reports errors when
-/// elements cannot be validated.
+/// Unlike the lax version, `processContents="strict"` requires a global
+/// declaration for every matched element and reports an error otherwise.
 fn validate_any_wildcard_strict(
     doc: &Document,
     children: &[NodeId],
     any: &XsdAny,
     parent_name: &str,
-    owner_ns: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
 ) -> usize {
-    let target_ns = if owner_ns.is_empty() {
-        schema.target_namespace.as_deref().unwrap_or("")
-    } else {
-        owner_ns
-    };
-    let mut count: usize = 0;
-
-    for &child in children {
-        let child_ns = doc.node_namespace(child).unwrap_or("");
-        let matches_ns = match &any.namespace {
-            XsdAnyNamespace::Any => true,
-            XsdAnyNamespace::Other => child_ns != target_ns,
-            XsdAnyNamespace::List(ns_list) => {
-                ns_list.iter().any(|ns| child_ns == ns.as_str())
-                    || (ns_list.iter().any(|ns| ns == "##targetNamespace") && child_ns == target_ns)
-                    || (ns_list.iter().any(|ns| ns == "##local") && child_ns.is_empty())
-            }
-        };
-
-        if !matches_ns {
-            break;
-        }
-
-        if let MaxOccurs::Bounded(max) = any.max_occurs {
-            if count >= max as usize {
-                break;
-            }
-        }
-
-        let child_name = doc.node_name(child).unwrap_or("");
-        match any.process_contents {
-            XsdProcessContents::Skip => {
-                // Accept without validation
-            }
-            XsdProcessContents::Lax => {
-                // Validate if declaration found, accept otherwise
-                if let Some(decl) = schema.elements.get(child_name).cloned() {
-                    validate_element_strict(doc, child, &decl, schema, errors);
-                } else if let Some(decl) = find_root_element_in_imports(child_name, schema).cloned()
-                {
-                    validate_element_strict(doc, child, &decl, schema, errors);
-                }
-            }
-            XsdProcessContents::Strict => {
-                // Must validate — try to find the element declaration
-                if let Some(decl) = schema.elements.get(child_name).cloned() {
-                    validate_element_strict(doc, child, &decl, schema, errors);
-                } else if let Some(decl) = find_root_element_in_imports(child_name, schema) {
-                    validate_element_strict(doc, child, decl, schema, errors);
-                } else {
-                    errors.push(ValidationError {
-                        message: format!(
-                            "element <{child_name}> in <{parent_name}> matched xsd:any wildcard but has no declaration in the schema (processContents=strict)"
-                        ),
-                        line: None,
-                        column: None,
-                    });
-                }
-            }
-        }
-
-        count += 1;
-    }
-
-    if count < any.min_occurs as usize {
-        errors.push(ValidationError {
-            message: format!(
-                "element <{parent_name}> requires at least {} wildcard element(s), found {count}",
-                any.min_occurs
-            ),
-            line: None,
-            column: None,
-        });
-    }
-
-    count
-}
-
-/// Searches imported schemas for a global element declaration.
-///
-/// This handles cases where the root element is declared in an imported
-/// schema (e.g., `AX_Bestandsdatenauszug` in `NAS-Operationen.xsd`
-/// imported by `AAA-Basisschema.xsd`).
-fn find_root_element_in_imports<'a>(
-    root_name: &str,
-    schema: &'a XsdSchema,
-) -> Option<&'a XsdElement> {
-    for imported in schema.imported_namespaces.values() {
-        if let Some(decl) = imported.elements.get(root_name) {
-            return Some(decl);
-        }
-    }
-    None
+    validate_any_wildcard_impl(doc, children, any, parent_name, schema, errors, true)
 }
 
 /// Validates a single element against its declaration.
@@ -2717,7 +2585,8 @@ fn validate_element(
     match resolve_element_type(decl, schema) {
         Some(XsdType::Complex(ct)) => validate_complex_element(doc, node, ct, schema, errors),
         Some(XsdType::Simple(st)) => validate_simple_element(doc, node, st, schema, errors),
-        None => {} // anyType
+        // anyType (or a type unknown to the schema): assess content laxly.
+        None => validate_children_laxly(doc, node, schema, errors, false),
     }
 }
 
@@ -2825,7 +2694,7 @@ fn validate_complex_element(
         }
         ComplexContent::Choice(p) => {
             let ce = collect_child_elements(doc, node);
-            validate_choice(doc, &ce, p, elem_name, schema, errors);
+            validate_choice(doc, &ce, p, elem_name, schema, errors, false);
         }
         ComplexContent::All(p) => {
             let ce = collect_child_elements(doc, node);
@@ -3267,7 +3136,7 @@ fn validate_group_content(
             validate_sequence(doc, children, particles, parent_name, schema, errors, false)
         }
         ComplexContent::Choice(particles) => {
-            validate_choice(doc, children, particles, parent_name, schema, errors);
+            validate_choice(doc, children, particles, parent_name, schema, errors, false);
             usize::from(!children.is_empty())
         }
         _ => 0,
@@ -3284,47 +3153,35 @@ fn validate_any_wildcard(
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
 ) -> usize {
-    let target_ns = schema.target_namespace.as_deref().unwrap_or("");
-    let mut count: u32 = 0;
-    let mut consumed = 0;
+    validate_any_wildcard_impl(doc, children, any, parent_name, schema, errors, false)
+}
 
+/// Consumes the children matching `any` and validates each according to
+/// its `processContents`; `strict` selects the strict API's rules.
+fn validate_any_wildcard_impl(
+    doc: &Document,
+    children: &[NodeId],
+    any: &XsdAny,
+    parent_name: &str,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+    strict: bool,
+) -> usize {
+    let mut count: usize = 0;
     for &child in children {
-        let child_ns = doc.node_namespace(child).unwrap_or("");
-        let matches_ns = match &any.namespace {
-            XsdAnyNamespace::Any => true,
-            XsdAnyNamespace::Other => child_ns != target_ns,
-            XsdAnyNamespace::List(ns_list) => {
-                ns_list.iter().any(|ns| child_ns == ns.as_str())
-                    || (ns_list.iter().any(|ns| ns == "##targetNamespace") && child_ns == target_ns)
-                    || (ns_list.iter().any(|ns| ns == "##local") && child_ns.is_empty())
-            }
-        };
-
-        if !matches_ns {
+        if !wildcard_allows(any, doc.node_namespace(child)) {
             break;
         }
-
         if let MaxOccurs::Bounded(max) = any.max_occurs {
-            if count >= max {
+            if count >= max as usize {
                 break;
             }
         }
-
-        // For lax/skip: just accept the element without validation
-        // For strict: we would need to resolve the element's type,
-        // but for now accept it (strict validation of xsd:any is
-        // complex and requires cross-schema element resolution)
-        match any.process_contents {
-            XsdProcessContents::Skip | XsdProcessContents::Lax | XsdProcessContents::Strict => {
-                // Accept without validation
-            }
-        }
-
+        validate_wildcard_child(doc, child, any, parent_name, schema, errors, strict);
         count += 1;
-        consumed += 1;
     }
 
-    if count < any.min_occurs {
+    if count < any.min_occurs as usize {
         errors.push(ValidationError {
             message: format!(
                 "element <{parent_name}> requires at least {} wildcard element(s), found {count}",
@@ -3335,10 +3192,98 @@ fn validate_any_wildcard(
         });
     }
 
-    consumed
+    count
+}
+
+/// Whether the wildcard's namespace constraint allows `child_ns`
+/// (XSD 1.0 §3.10.4, Wildcard allows Namespace Name).
+fn wildcard_allows(any: &XsdAny, child_ns: Option<&str>) -> bool {
+    let child_ns = child_ns.filter(|ns| !ns.is_empty());
+    let target_ns = any.target_namespace.as_deref();
+    match &any.namespace {
+        XsdAnyNamespace::Any => true,
+        // `##other` excludes the target namespace and absent.
+        XsdAnyNamespace::Other => child_ns.is_some() && child_ns != target_ns,
+        XsdAnyNamespace::List(ns_list) => ns_list.iter().any(|ns| match ns.as_str() {
+            "##targetNamespace" => child_ns == target_ns,
+            "##local" => child_ns.is_none(),
+            uri => child_ns == Some(uri),
+        }),
+    }
+}
+
+/// Validates one element matched by a wildcard (XSD 1.0 §3.10.1
+/// {process contents}).
+///
+/// `skip` validates nothing. `lax` validates against the global declaration
+/// if there is one and otherwise assesses the element's children laxly.
+/// `strict` requires the declaration; the lax API (`strict == false`)
+/// treats it like `lax`.
+fn validate_wildcard_child(
+    doc: &Document,
+    child: NodeId,
+    any: &XsdAny,
+    parent_name: &str,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+    strict: bool,
+) {
+    match any.process_contents {
+        XsdProcessContents::Skip => {}
+        XsdProcessContents::Strict if strict => {
+            let child_name = doc.node_name(child).unwrap_or("");
+            if let Some(decl) = find_global_element(schema, doc.node_namespace(child), child_name) {
+                validate_element_strict(doc, child, decl, schema, errors);
+            } else {
+                errors.push(ValidationError {
+                    message: format!(
+                        "element <{child_name}> in <{parent_name}> matched xsd:any wildcard but has no declaration in the schema (processContents=strict)"
+                    ),
+                    line: None,
+                    column: None,
+                });
+            }
+        }
+        XsdProcessContents::Strict | XsdProcessContents::Lax => {
+            validate_laxly(doc, child, schema, errors, strict);
+        }
+    }
+}
+
+/// Lax assessment of an element: validates it against its global
+/// declaration if there is one, otherwise assesses its children laxly.
+fn validate_laxly(
+    doc: &Document,
+    node: NodeId,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+    strict: bool,
+) {
+    let name = doc.node_name(node).unwrap_or("");
+    match find_global_element(schema, doc.node_namespace(node), name) {
+        Some(decl) if strict => validate_element_strict(doc, node, decl, schema, errors),
+        Some(decl) => validate_element(doc, node, decl, schema, errors),
+        None => validate_children_laxly(doc, node, schema, errors, strict),
+    }
+}
+
+/// Lax assessment of the element children of `node`, used for wildcard
+/// matches without a declaration and for anyType content.
+fn validate_children_laxly(
+    doc: &Document,
+    node: NodeId,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+    strict: bool,
+) {
+    for child in collect_child_elements(doc, node) {
+        validate_laxly(doc, child, schema, errors, strict);
+    }
 }
 
 /// Validates a choice content model.
+///
+/// `strict` selects the strict API's rules for wildcard matches.
 fn validate_choice(
     doc: &Document,
     children: &[NodeId],
@@ -3346,6 +3291,7 @@ fn validate_choice(
     parent_name: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
+    strict: bool,
 ) {
     if children.is_empty() {
         let any_optional = particles
@@ -3370,8 +3316,11 @@ fn validate_choice(
                 }
                 false
             }
-            XsdParticle::Any(_) => {
-                // Wildcard matches any element — accept
+            XsdParticle::Any(any) => {
+                if !wildcard_allows(any, doc.node_namespace(first)) {
+                    return false;
+                }
+                validate_wildcard_child(doc, first, any, parent_name, schema, errors, strict);
                 true
             }
             XsdParticle::Group(ct) => {
@@ -3405,6 +3354,7 @@ fn validate_choice(
                             parent_name,
                             schema,
                             &mut sub_errors,
+                            strict,
                         );
                         if sub_errors.is_empty() {
                             return true;
@@ -5824,6 +5774,175 @@ mod tests {
         let doc = Document::parse_str("<root><a>1</a><c>3</c><b>2</b></root>").unwrap();
         assert!(!validate_xsd(&doc, &schema).is_valid);
         assert!(!validate_xsd_strict(&doc, &schema).is_valid);
+    }
+
+    /// Main schema `urn:a` with wildcards of every `processContents` value,
+    /// importing `urn:w` whose `member` holds a lax `##other` wildcard in a
+    /// choice (the WFS 2.0 `wfs:member` pattern).
+    fn wildcard_schema() -> XsdSchema {
+        let resolver = make_resolver(vec![(
+            "w.xsd",
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:w="urn:w" targetNamespace="urn:w"
+                        elementFormDefault="qualified">
+                <xs:element name="member">
+                    <xs:complexType><xs:choice minOccurs="0">
+                        <xs:any processContents="lax" namespace="##other"/>
+                        <xs:element name="tuple" type="xs:string"/>
+                    </xs:choice></xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        parse_xsd_with_options(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:a="urn:a" xmlns:w="urn:w" targetNamespace="urn:a"
+                        elementFormDefault="qualified">
+                <xs:import namespace="urn:w" schemaLocation="w.xsd"/>
+                <xs:element name="feat">
+                    <xs:complexType><xs:sequence>
+                        <xs:element name="must" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+                <xs:element name="Record"/>
+                <xs:element name="root">
+                    <xs:complexType><xs:sequence>
+                        <xs:element name="lax" minOccurs="0">
+                            <xs:complexType><xs:sequence>
+                                <xs:any processContents="lax" maxOccurs="unbounded"/>
+                            </xs:sequence></xs:complexType>
+                        </xs:element>
+                        <xs:element name="skip" minOccurs="0">
+                            <xs:complexType><xs:sequence>
+                                <xs:any processContents="skip" maxOccurs="unbounded"/>
+                            </xs:sequence></xs:complexType>
+                        </xs:element>
+                        <xs:element name="strict" minOccurs="0">
+                            <xs:complexType><xs:sequence>
+                                <xs:any maxOccurs="unbounded"/>
+                            </xs:sequence></xs:complexType>
+                        </xs:element>
+                        <xs:element name="other" minOccurs="0">
+                            <xs:complexType><xs:sequence>
+                                <xs:any processContents="skip" namespace="##other"/>
+                            </xs:sequence></xs:complexType>
+                        </xs:element>
+                        <xs:element ref="w:member" minOccurs="0"/>
+                        <xs:element ref="a:Record" minOccurs="0"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+            &opts,
+        )
+        .unwrap()
+    }
+
+    fn wildcard_doc(body: &str) -> String {
+        format!(r#"<root xmlns="urn:a" xmlns:w="urn:w">{body}</root>"#)
+    }
+
+    #[test]
+    fn test_validate_xsd_lax_wildcard_validates_declared_element() {
+        let schema = wildcard_schema();
+        assert_both_modes(
+            &schema,
+            &wildcard_doc("<lax><feat><must>1</must></feat></lax>"),
+            true,
+        );
+        assert_both_modes(
+            &schema,
+            &wildcard_doc("<lax><feat><bogus>1</bogus></feat></lax>"),
+            false,
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_lax_wildcard_descends_into_undeclared_element() {
+        let schema = wildcard_schema();
+        assert_both_modes(
+            &schema,
+            &wildcard_doc("<lax><unknown><x/></unknown></lax>"),
+            true,
+        );
+        assert_both_modes(
+            &schema,
+            &wildcard_doc("<lax><unknown><feat><bogus>1</bogus></feat></unknown></lax>"),
+            false,
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_skip_wildcard_is_not_validated() {
+        assert_both_modes(
+            &wildcard_schema(),
+            &wildcard_doc("<skip><feat><bogus>1</bogus></feat></skip>"),
+            true,
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_strict_wildcard_validates_declared_element() {
+        let schema = wildcard_schema();
+        assert_both_modes(
+            &schema,
+            &wildcard_doc("<strict><feat><must>1</must></feat></strict>"),
+            true,
+        );
+        assert_both_modes(
+            &schema,
+            &wildcard_doc("<strict><feat><bogus>1</bogus></feat></strict>"),
+            false,
+        );
+        // An undeclared element is an error for the strict API only; the lax
+        // API does not require declarations for strict wildcards.
+        let doc = Document::parse_str(&wildcard_doc("<strict><unknown/></strict>")).unwrap();
+        assert!(validate_xsd(&doc, &schema).is_valid);
+        assert!(!validate_xsd_strict(&doc, &schema).is_valid);
+    }
+
+    #[test]
+    fn test_validate_xsd_lax_wildcard_in_choice() {
+        let schema = wildcard_schema();
+        assert_both_modes(
+            &schema,
+            &wildcard_doc("<w:member><feat><must>1</must></feat></w:member>"),
+            true,
+        );
+        assert_both_modes(
+            &schema,
+            &wildcard_doc("<w:member><feat><bogus>1</bogus></feat></w:member>"),
+            false,
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_other_wildcard_rejects_unqualified_element() {
+        // XSD 1.0 §3.10.4: ##other excludes the target namespace and absent.
+        let schema = wildcard_schema();
+        assert_both_modes(&schema, &wildcard_doc("<other><w:tuple/></other>"), true);
+        assert_both_modes(
+            &schema,
+            &wildcard_doc(r#"<other><x xmlns=""/></other>"#),
+            false,
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_any_type_content_is_assessed_laxly() {
+        let schema = wildcard_schema();
+        assert_both_modes(
+            &schema,
+            &wildcard_doc("<Record><feat><must>1</must></feat></Record>"),
+            true,
+        );
+        assert_both_modes(
+            &schema,
+            &wildcard_doc("<Record><feat><bogus>1</bogus></feat></Record>"),
+            false,
+        );
     }
 
     // ── Substitution group tests ──────────────────────────────────────────
