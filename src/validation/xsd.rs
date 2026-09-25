@@ -2173,23 +2173,37 @@ pub fn validate_element_strict(
             validate_attributes_strict(doc, node, &[], schema, errors);
         }
         None => {
-            // No declared type defaults to xs:anyType (valid in XSD).
-            if decl.type_ref.is_none() && decl.inline_type.is_none() && decl.element_ref.is_none() {
-                return;
+            // A declaration without type and inline type (directly or via
+            // `ref`) has the ur-type anyType (XSD 1.0 §3.3.2); anything else
+            // is a real unresolved-type error.
+            if !declares_any_type(decl, schema) {
+                let elem_name = doc.node_name(node).unwrap_or("<unknown>");
+                errors.push(ValidationError {
+                    message: format!("element <{elem_name}> has no resolvable type declaration"),
+                    line: None,
+                    column: None,
+                });
             }
-            // Otherwise this is a real unresolved-type error.
-            let elem_name = doc.node_name(node).unwrap_or("<unknown>");
-            errors.push(ValidationError {
-                message: format!("element <{elem_name}> has no resolvable type declaration"),
-                line: None,
-                column: None,
-            });
+            // Content of an element without a usable type is assessed laxly:
+            // children with a global declaration are validated against it.
+            validate_children_by_schema_lookup(doc, node, schema, errors);
         }
     }
 }
 
-/// Deep validation fallback: when an element has no resolved type (e.g.
-/// `wfs:member` from an external namespace), validate each of its children
+/// Returns `true` when `decl` (or the global declaration it references)
+/// declares neither a type nor an inline type, i.e. has the anyType
+/// definition. An unresolvable `ref` does not count as anyType.
+fn declares_any_type(decl: &XsdElement, schema: &XsdSchema) -> bool {
+    match decl.element_ref {
+        Some(ref ref_qname) => resolve_element_ref(ref_qname, schema)
+            .is_some_and(|target| target.type_ref.is_none() && target.inline_type.is_none()),
+        None => decl.type_ref.is_none() && decl.inline_type.is_none(),
+    }
+}
+
+/// Deep validation fallback: when an element has no resolved type (anyType,
+/// or a type unknown to the schema), validate each of its children
 /// by looking them up as global element declarations in the schema.
 /// This enables validation of AAA feature elements nested inside WFS/GML
 /// wrapper elements whose types are unknown to the AAA schema.
@@ -2402,12 +2416,6 @@ fn validate_sequence_strict(
                     let effective =
                         resolve_substitution_member_decl(doc, children[idx], decl, schema);
                     validate_element_strict(doc, children[idx], effective, schema, errors);
-                    // Deep validation: if the element has no declared type
-                    // (e.g. wfs:member), validate its children against schema
-                    // declarations that match by local name.
-                    validate_children_by_schema_lookup(
-                        doc, children[idx], schema, errors,
-                    );
                     idx += 1;
                     handle_repeat_occurrences_strict(
                         doc, children, &mut idx, decl, schema, errors,
@@ -5574,6 +5582,57 @@ mod tests {
         assert!(
             result.is_valid,
             "unqualified children should pass: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_strict_ref_to_untyped_global_is_any_type() {
+        // XSD 1.0 §3.3.2: a global element without a type and without an
+        // inline type definition has the ur-type (anyType) definition.
+        let schema = make_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="Record"/>
+                <xs:element name="root">
+                    <xs:complexType><xs:sequence>
+                        <xs:element ref="Record"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let doc =
+            Document::parse_str("<root><Record><anything>1</anything></Record></root>").unwrap();
+        let result = validate_xsd_strict(&doc, &schema);
+        assert!(
+            result.is_valid,
+            "ref to untyped global element is anyType: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_validate_xsd_strict_reports_child_error_once() {
+        let schema = make_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="value" type="xs:int"/>
+                <xs:element name="item">
+                    <xs:complexType><xs:sequence>
+                        <xs:element ref="value"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+                <xs:element name="root">
+                    <xs:complexType><xs:sequence>
+                        <xs:element ref="item"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let doc = Document::parse_str("<root><item><value>abc</value></item></root>").unwrap();
+        let result = validate_xsd_strict(&doc, &schema);
+        assert_eq!(
+            result.errors.len(),
+            1,
+            "one defect, one error: {:?}",
             result.errors
         );
     }
