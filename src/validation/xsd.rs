@@ -336,6 +336,12 @@ pub struct ComplexType {
     /// When set, the base type's content model particles must appear before
     /// this type's own particles during validation.
     pub extension_base: Option<String>,
+    /// Namespace URI of [`extension_base`](Self::extension_base), resolved
+    /// with the prefixes in scope at the `<xs:extension>` element.
+    ///
+    /// `None` when the qualified name has no resolvable namespace; the base is then
+    /// looked up by local name alone.
+    pub extension_base_namespace: Option<String>,
 }
 
 /// The content model of a complex type.
@@ -1046,23 +1052,21 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
     // This avoids borrow conflicts between mutable types and immutable schema.
 
     // Main schema extensions
-    let main_extensions: Vec<(String, String)> = schema
+    let main_extensions: Vec<(String, TypeKey)> = schema
         .types
         .iter()
         .filter_map(|(name, ty)| {
             if let XsdType::Complex(ct) = ty {
-                ct.extension_base
-                    .as_ref()
-                    .map(|base| (name.clone(), base.clone()))
+                extension_base_key(ct).map(|base| (name.clone(), base))
             } else {
                 None
             }
         })
         .collect();
 
-    for (type_name, base_name) in main_extensions {
-        let base_particles = resolve_base_particles(&base_name, schema);
-        let base_attrs = resolve_base_attributes(&base_name, schema);
+    for (type_name, base) in main_extensions {
+        let base_particles = resolve_base_particles(&base, schema);
+        let base_attrs = resolve_base_attributes(&base, schema);
         if base_particles.is_empty() && base_attrs.is_empty() {
             continue;
         }
@@ -1070,15 +1074,13 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
     }
 
     // Imported namespace extensions
-    let imported_extensions: Vec<(String, String, String)> = schema
+    let imported_extensions: Vec<(String, String, TypeKey)> = schema
         .imported_namespaces
         .iter()
         .flat_map(|(ns, imp)| {
             imp.types.iter().filter_map(|(name, ty)| {
                 if let XsdType::Complex(ct) = ty {
-                    ct.extension_base
-                        .as_ref()
-                        .map(|base| (ns.clone(), name.clone(), base.clone()))
+                    extension_base_key(ct).map(|base| (ns.clone(), name.clone(), base))
                 } else {
                     None
                 }
@@ -1086,9 +1088,9 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
         })
         .collect();
 
-    for (ns, type_name, base_name) in imported_extensions {
-        let base_particles = resolve_base_particles(&base_name, schema);
-        let base_attrs = resolve_base_attributes(&base_name, schema);
+    for (ns, type_name, base) in imported_extensions {
+        let base_particles = resolve_base_particles(&base, schema);
+        let base_attrs = resolve_base_attributes(&base, schema);
         if base_particles.is_empty() && base_attrs.is_empty() {
             continue;
         }
@@ -1130,37 +1132,32 @@ fn merge_type_extension(
             ct.attributes = merged_attrs;
         }
         ct.extension_base = None;
+        ct.extension_base_namespace = None;
     }
 }
 
 /// Resolves a type's attributes, chasing extension chains.
 /// Returns all inherited attributes from the full type hierarchy.
-fn resolve_base_attributes(type_name: &str, schema: &XsdSchema) -> Vec<XsdAttribute> {
-    resolve_base_attributes_impl(type_name, schema, &mut HashSet::new())
+fn resolve_base_attributes(base: &TypeKey, schema: &XsdSchema) -> Vec<XsdAttribute> {
+    resolve_base_attributes_impl(base, schema, &mut HashSet::new())
 }
 
 fn resolve_base_attributes_impl(
-    type_name: &str,
+    key: &TypeKey,
     schema: &XsdSchema,
-    visited: &mut HashSet<String>,
+    visited: &mut HashSet<TypeKey>,
 ) -> Vec<XsdAttribute> {
-    let local_name = if let Some((_, l)) = type_name.split_once(':') {
-        l
-    } else {
-        type_name
-    };
-
-    if !visited.insert(local_name.to_string()) {
+    if !visited.insert(key.clone()) {
         return Vec::new();
     }
 
-    let Some(ct) = find_complex_type(local_name, schema) else {
+    let Some(ct) = find_complex_type_by_key(key, schema) else {
         return Vec::new();
     };
 
     // Recursively get base attributes first
-    let mut attrs = if let Some(ref base) = ct.extension_base {
-        resolve_base_attributes_impl(base, schema, visited)
+    let mut attrs = if let Some(base) = extension_base_key(ct) {
+        resolve_base_attributes_impl(&base, schema, visited)
     } else {
         Vec::new()
     };
@@ -1174,6 +1171,38 @@ fn resolve_base_attributes_impl(
 ///
 /// Returns the effective particles for a type including all inherited
 /// base-type particles, in the correct XSD derivation order.
+/// A type name as `(namespace URI, local name)`.
+///
+/// Base types are resolved and cycle-checked by this key, not by the local
+/// name: `gml:AbstractCoverageType` and `gmlcov:AbstractCoverageType` are
+/// different types, and the second extends the first.
+type TypeKey = (Option<String>, String);
+
+fn extension_base_key(ct: &ComplexType) -> Option<TypeKey> {
+    let base = ct.extension_base.as_deref()?;
+    let local = base.split_once(':').map_or(base, |(_, l)| l);
+    Some((ct.extension_base_namespace.clone(), local.to_string()))
+}
+
+/// Looks up a complex type by namespace and local name.
+///
+/// Without a namespace the lookup falls back to [`find_complex_type`].
+fn find_complex_type_by_key<'a>(key: &TypeKey, schema: &'a XsdSchema) -> Option<&'a ComplexType> {
+    let (ns, local) = key;
+    let Some(ns) = ns.as_deref() else {
+        return find_complex_type(local, schema);
+    };
+    let types = if schema.target_namespace.as_deref() == Some(ns) {
+        &schema.types
+    } else {
+        &schema.imported_namespaces.get(ns)?.types
+    };
+    match types.get(local) {
+        Some(XsdType::Complex(ct)) => Some(ct),
+        _ => None,
+    }
+}
+
 /// Looks up a complex type by local name, checking local types and
 /// imported namespace types.
 fn find_complex_type<'a>(local_name: &str, schema: &'a XsdSchema) -> Option<&'a ComplexType> {
@@ -1189,33 +1218,26 @@ fn find_complex_type<'a>(local_name: &str, schema: &'a XsdSchema) -> Option<&'a 
     None
 }
 
-fn resolve_base_particles(type_name: &str, schema: &XsdSchema) -> Vec<XsdParticle> {
-    resolve_base_particles_impl(type_name, schema, &mut HashSet::new())
+fn resolve_base_particles(base: &TypeKey, schema: &XsdSchema) -> Vec<XsdParticle> {
+    resolve_base_particles_impl(base, schema, &mut HashSet::new())
 }
 
 fn resolve_base_particles_impl(
-    type_name: &str,
+    key: &TypeKey,
     schema: &XsdSchema,
-    visited: &mut HashSet<String>,
+    visited: &mut HashSet<TypeKey>,
 ) -> Vec<XsdParticle> {
-    // Resolve QName prefix (e.g., "adv:AA_ObjektType" → "AA_ObjektType")
-    let local_name = if let Some((_, l)) = type_name.split_once(':') {
-        l
-    } else {
-        type_name
-    };
-
-    if !visited.insert(local_name.to_string()) {
+    if !visited.insert(key.clone()) {
         return Vec::new(); // Cycle detected, stop
     }
 
-    let Some(ct) = find_complex_type(local_name, schema) else {
+    let Some(ct) = find_complex_type_by_key(key, schema) else {
         return Vec::new();
     };
 
     // Recursively resolve base type particles first
-    let mut particles = if let Some(ref base) = ct.extension_base {
-        resolve_base_particles_impl(base, schema, visited)
+    let mut particles = if let Some(base) = extension_base_key(ct) {
+        resolve_base_particles_impl(&base, schema, visited)
     } else {
         Vec::new()
     };
@@ -1368,14 +1390,7 @@ fn parse_element_decl(
         } else {
             ref_qname.to_string()
         };
-        let prefix = ref_qname.split_once(':').map(|(p, _)| p);
-        let namespace = lookup_namespace_uri(doc, node, prefix).or_else(|| {
-            // Chameleon include: unqualified references take the including
-            // document's target namespace.
-            (prefix.is_none() && ctx.chameleon)
-                .then(|| ctx.target_ns.map(String::from))
-                .flatten()
-        });
+        let namespace = qname_namespace(doc, node, ref_qname, ctx);
         return Some(XsdElement {
             name: local_name,
             type_ref: None,
@@ -1454,6 +1469,7 @@ fn parse_complex_type(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> Co
     let mut content = ComplexContent::Empty;
     let mut attributes = Vec::new();
     let mut extension_base: Option<String> = None;
+    let mut extension_base_namespace: Option<String> = None;
 
     for child in doc.children(node) {
         let Some(child_name) = doc.node_name(child) else {
@@ -1495,6 +1511,9 @@ fn parse_complex_type(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> Co
             }
             "complexContent" => {
                 let (base, ct, ext_attrs) = parse_complex_content(doc, child, ctx);
+                extension_base_namespace = base
+                    .as_deref()
+                    .and_then(|qname| qname_namespace(doc, child, qname, ctx));
                 extension_base = base;
                 content = ct;
                 attributes.extend(ext_attrs);
@@ -1508,6 +1527,7 @@ fn parse_complex_type(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> Co
         attributes,
         mixed,
         extension_base,
+        extension_base_namespace,
     }
 }
 
@@ -1997,6 +2017,24 @@ fn build_prefix_map(doc: &Document, node: NodeId) -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Resolves the namespace URI of a QName-valued attribute of `node`.
+///
+/// In a chameleon include an unprefixed qualified name takes the including
+/// document's target namespace (XSD 1.0 section 4.2.1).
+fn qname_namespace(
+    doc: &Document,
+    node: NodeId,
+    qname: &str,
+    ctx: &DeclContext<'_>,
+) -> Option<String> {
+    let prefix = qname.split_once(':').map(|(p, _)| p);
+    lookup_namespace_uri(doc, node, prefix).or_else(|| {
+        (prefix.is_none() && ctx.chameleon)
+            .then(|| ctx.target_ns.map(String::from))
+            .flatten()
+    })
 }
 
 /// Resolves `prefix` (or the default namespace for `None`) to its namespace
@@ -5601,6 +5639,77 @@ mod tests {
     }
 
     /// Main schema `urn:a` importing `urn:b`, both `elementFormDefault="qualified"`.
+    /// Two base types share the local name `CoverageType` in `urn:g` and
+    /// `urn:c`; `c:CoverageType` extends `g:CoverageType`. The merged
+    /// content of a type derived from the `urn:c` chain must hold both
+    /// levels in derivation order, in every parse (the imported namespaces
+    /// live in a `HashMap` whose order changes per instance).
+    fn same_local_name_base_schema() -> XsdSchema {
+        let resolver = make_resolver(vec![
+            (
+                "g.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                            targetNamespace="urn:g" elementFormDefault="qualified">
+                    <xs:complexType name="CoverageType"><xs:sequence>
+                        <xs:element name="domainSet" type="xs:string"/>
+                        <xs:element name="rangeSet" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:schema>"#,
+            ),
+            (
+                "c.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                            xmlns:g="urn:g" xmlns:c="urn:c"
+                            targetNamespace="urn:c" elementFormDefault="qualified">
+                    <xs:import namespace="urn:g" schemaLocation="g.xsd"/>
+                    <xs:complexType name="CoverageType"><xs:complexContent>
+                        <xs:extension base="g:CoverageType"><xs:sequence>
+                            <xs:element name="rangeType" type="xs:string"/>
+                        </xs:sequence></xs:extension>
+                    </xs:complexContent></xs:complexType>
+                    <xs:complexType name="DiscreteCoverageType"><xs:complexContent>
+                        <xs:extension base="c:CoverageType"><xs:sequence/></xs:extension>
+                    </xs:complexContent></xs:complexType>
+                </xs:schema>"#,
+            ),
+        ]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:c="urn:c" xmlns:a="urn:a" targetNamespace="urn:a"
+                        elementFormDefault="qualified">
+                <xs:import namespace="urn:g" schemaLocation="g.xsd"/>
+                <xs:import namespace="urn:c" schemaLocation="c.xsd"/>
+                <xs:complexType name="GridType"><xs:complexContent>
+                    <xs:extension base="c:DiscreteCoverageType"><xs:sequence>
+                        <xs:element name="own" type="xs:string"/>
+                    </xs:sequence></xs:extension>
+                </xs:complexContent></xs:complexType>
+                <xs:element name="grid" type="a:GridType"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_extension_base_resolved_by_namespace_not_local_name() {
+        for _ in 0..32 {
+            let schema = same_local_name_base_schema();
+            assert_eq!(
+                get_type_element_order("GridType", &schema),
+                Some(
+                    ["domainSet", "rangeSet", "rangeType", "own"]
+                        .map(String::from)
+                        .to_vec()
+                ),
+            );
+        }
+    }
+
     fn two_namespace_schema() -> XsdSchema {
         let resolver = make_resolver(vec![(
             "b.xsd",
