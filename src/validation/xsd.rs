@@ -567,6 +567,9 @@ pub fn parse_xsd_with_options(
 
     parse_xsd_internal(schema_xml, options, &mut loaded, &mut schema, None)?;
 
+    // Replace `<xsd:group ref>` placeholders now that every group is known.
+    resolve_group_refs(&mut schema);
+
     // Build substitution group index from all element declarations.
     build_substitution_index(&mut schema);
 
@@ -642,36 +645,14 @@ fn parse_top_level_declarations(
 ) -> Result<(), ValidationError> {
     let target_ns = this_ns.map(String::as_str).filter(|ns| !ns.is_empty());
     let qualified = doc.attribute(root, "elementFormDefault") == Some("qualified");
-    // Pass 1: collect named model groups so type parsing can resolve <group ref="...">
-    for child in doc.children(root) {
-        if doc.node_name(child) != Some("group") {
-            continue;
-        }
-        let Some(group_name) = doc.attribute(child, "name") else {
-            continue;
-        };
-        let ctx = DeclContext {
-            target_ns,
-            chameleon,
-            qualified,
-            group_defs: &schema.model_groups,
-        };
-        if let Some(group_content) = parse_named_group(doc, child, &ctx) {
-            schema
-                .model_groups
-                .insert(group_name.to_string(), group_content);
-        }
-    }
-
-    let group_defs = schema.model_groups.clone();
     let ctx = DeclContext {
         target_ns,
         chameleon,
         qualified,
-        group_defs: &group_defs,
     };
 
-    // Pass 2: parse all regular top-level declarations
+    // Group references stay placeholders until `resolve_group_refs`, which
+    // runs once every included and imported document is loaded.
     for child in doc.children(root) {
         let Some(name) = doc.node_name(child) else {
             continue;
@@ -692,6 +673,15 @@ fn parse_top_level_declarations(
                 let st = parse_simple_type(doc, child);
                 if let Some(ref type_name) = st.name {
                     schema.types.insert(type_name.clone(), XsdType::Simple(st));
+                }
+            }
+            "group" => {
+                if let Some(group_name) = doc.attribute(child, "name") {
+                    if let Some(group_content) = parse_named_group(doc, child, &ctx) {
+                        schema
+                            .model_groups
+                            .insert(group_name.to_string(), group_content);
+                    }
                 }
             }
             "attributeGroup" => {
@@ -1044,6 +1034,189 @@ fn resolve_attribute_groups(schema: &mut XsdSchema) {
         for decl in imp.elements.values_mut() {
             expand_attr_groups_in_element(decl, &all_groups);
         }
+    }
+}
+
+/// First entry of the namespace list of the [`XsdAny`] that stands for a
+/// `<xsd:group ref>` until [`resolve_group_refs`] replaces it. The list is
+/// `[GROUP_REF, namespace URI or "", local name]`.
+const GROUP_REF: &str = "__group_ref__";
+
+/// The placeholder for a `<xsd:group ref>` with the reference's own
+/// occurrences. Should the group stay unknown it becomes a lax `##any`
+/// wildcard, the way an element of an unknown type is assessed laxly.
+fn group_ref_placeholder(
+    namespace: Option<String>,
+    local: &str,
+    min_occurs: u32,
+    max_occurs: MaxOccurs,
+) -> XsdAny {
+    XsdAny {
+        namespace: XsdAnyNamespace::List(vec![
+            GROUP_REF.to_string(),
+            namespace.unwrap_or_default(),
+            local.to_string(),
+        ]),
+        process_contents: XsdProcessContents::Lax,
+        min_occurs,
+        max_occurs,
+        target_namespace: None,
+    }
+}
+
+/// The group a [`group_ref_placeholder`] refers to.
+fn group_ref_target(any: &XsdAny) -> Option<TypeKey> {
+    match &any.namespace {
+        XsdAnyNamespace::List(list) if list.len() == 3 && list[0] == GROUP_REF => Some((
+            (!list[1].is_empty()).then(|| list[1].clone()),
+            list[2].clone(),
+        )),
+        _ => None,
+    }
+}
+
+/// Replaces every `<xsd:group ref>` placeholder with the referenced group's
+/// content model, carrying the reference's occurrences (XSD 1.0 §3.7.2).
+///
+/// Runs after all included and imported documents are loaded, so a group
+/// may be declared in another document or further down the same one. A
+/// reference is looked up by namespace and local name, then by local name
+/// alone like a type reference.
+fn resolve_group_refs(schema: &mut XsdSchema) {
+    let mut defs: HashMap<TypeKey, ComplexContent> = HashMap::new();
+    for (name, content) in &schema.model_groups {
+        defs.insert(
+            (schema.target_namespace.clone(), name.clone()),
+            content.clone(),
+        );
+    }
+    for (ns, imported) in &schema.imported_namespaces {
+        let ns = (!ns.is_empty()).then(|| ns.clone());
+        for (name, content) in &imported.model_groups {
+            defs.entry((ns.clone(), name.clone()))
+                .or_insert_with(|| content.clone());
+        }
+    }
+    let mut resolver = GroupResolver {
+        defs,
+        done: HashMap::new(),
+        active: HashSet::new(),
+    };
+    for content in schema.model_groups.values_mut() {
+        resolver.expand_content(content);
+    }
+    for typ in schema.types.values_mut() {
+        resolver.expand_type(typ);
+    }
+    for decl in schema.elements.values_mut() {
+        resolver.expand_element(decl);
+    }
+    for imported in schema.imported_namespaces.values_mut() {
+        for content in imported.model_groups.values_mut() {
+            resolver.expand_content(content);
+        }
+        for typ in imported.types.values_mut() {
+            resolver.expand_type(typ);
+        }
+        for decl in imported.elements.values_mut() {
+            resolver.expand_element(decl);
+        }
+    }
+}
+
+/// Resolves group definitions once each; `active` holds the groups being
+/// expanded, so a group reaching itself again (through an anonymous type)
+/// falls back to the lax wildcard instead of expanding forever.
+struct GroupResolver {
+    defs: HashMap<TypeKey, ComplexContent>,
+    done: HashMap<TypeKey, ComplexContent>,
+    active: HashSet<TypeKey>,
+}
+
+impl GroupResolver {
+    fn find_key(&self, key: &TypeKey) -> Option<TypeKey> {
+        if self.defs.contains_key(key) {
+            return Some(key.clone());
+        }
+        self.defs.keys().filter(|(_, l)| *l == key.1).min().cloned()
+    }
+
+    fn resolve(&mut self, key: &TypeKey) -> Option<ComplexContent> {
+        let key = self.find_key(key)?;
+        if let Some(done) = self.done.get(&key) {
+            return Some(done.clone());
+        }
+        if !self.active.insert(key.clone()) {
+            return None;
+        }
+        let mut content = self.defs[&key].clone();
+        self.expand_content(&mut content);
+        self.active.remove(&key);
+        self.done.insert(key, content.clone());
+        Some(content)
+    }
+
+    fn expand_type(&mut self, typ: &mut XsdType) {
+        if let XsdType::Complex(ct) = typ {
+            self.expand_content(&mut ct.content);
+        }
+    }
+
+    fn expand_element(&mut self, decl: &mut XsdElement) {
+        if let Some(inline) = decl.inline_type.as_mut() {
+            self.expand_type(inline);
+        }
+    }
+
+    fn expand_content(&mut self, content: &mut ComplexContent) {
+        let particles = match content {
+            ComplexContent::Sequence(p)
+            | ComplexContent::Choice { particles: p, .. }
+            | ComplexContent::All(p) => p,
+            ComplexContent::Empty | ComplexContent::SimpleContent { .. } => return,
+        };
+        for particle in particles {
+            match particle {
+                XsdParticle::Element(decl) => self.expand_element(decl),
+                XsdParticle::Group(inner) => self.expand_content(inner),
+                XsdParticle::Any(any) => {
+                    let Some(target) = group_ref_target(any) else {
+                        continue;
+                    };
+                    match self.resolve(&target) {
+                        Some(group) => {
+                            *particle = XsdParticle::Group(with_ref_occurs(
+                                group,
+                                any.min_occurs,
+                                any.max_occurs.clone(),
+                            ));
+                        }
+                        None => any.namespace = XsdAnyNamespace::Any,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Applies a group reference's occurrences to the referenced model group.
+/// A group definition's own compositor carries none (XSD 1.0 §3.7.6), so
+/// the reference's replace them.
+fn with_ref_occurs(
+    group: ComplexContent,
+    min_occurs: u32,
+    max_occurs: MaxOccurs,
+) -> ComplexContent {
+    if min_occurs == 1 && max_occurs == MaxOccurs::Bounded(1) {
+        return group;
+    }
+    match group {
+        ComplexContent::Choice { particles, .. } => ComplexContent::Choice {
+            particles,
+            min_occurs,
+            max_occurs,
+        },
+        other => other,
     }
 }
 
@@ -1450,8 +1623,6 @@ struct DeclContext<'a> {
     chameleon: bool,
     /// `elementFormDefault="qualified"` on the declaring document.
     qualified: bool,
-    /// Named model groups visible for `<xs:group ref="...">`.
-    group_defs: &'a HashMap<String, ComplexContent>,
 }
 
 /// Parses an `<xs:any>` element wildcard declaration.
@@ -1572,16 +1743,7 @@ fn find_inline_type(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> Opti
         };
         match child_name {
             "complexType" => {
-                let no_groups = HashMap::new();
-                let inline_ctx = DeclContext {
-                    group_defs: &no_groups,
-                    ..*ctx
-                };
-                return Some(XsdType::Complex(parse_complex_type(
-                    doc,
-                    child,
-                    &inline_ctx,
-                )));
+                return Some(XsdType::Complex(parse_complex_type(doc, child, ctx)));
             }
             "simpleType" => {
                 return Some(XsdType::Simple(parse_simple_type(doc, child)));
@@ -1920,14 +2082,13 @@ fn parse_compositor(
             }
             "group" => {
                 if let Some(ref_qname) = doc.attribute(child, "ref") {
-                    let local = if let Some((_, l)) = ref_qname.split_once(':') {
-                        l
-                    } else {
-                        ref_qname
-                    };
-                    if let Some(group_content) = ctx.group_defs.get(local) {
-                        particles.push(XsdParticle::Group(group_content.clone()));
-                    }
+                    let local = ref_qname.split_once(':').map_or(ref_qname, |(_, l)| l);
+                    particles.push(XsdParticle::Any(group_ref_placeholder(
+                        qname_namespace(doc, child, ref_qname, ctx),
+                        local,
+                        parse_min_occurs(doc, child),
+                        parse_max_occurs(doc, child),
+                    )));
                 }
             }
             "any" => {
@@ -1970,6 +2131,18 @@ fn parse_min_occurs(doc: &Document, node: NodeId) -> u32 {
     doc.attribute(node, "minOccurs")
         .and_then(|v| v.parse().ok())
         .unwrap_or(1)
+}
+
+/// Parses the `maxOccurs` attribute from a particle node (default 1).
+fn parse_max_occurs(doc: &Document, node: NodeId) -> MaxOccurs {
+    doc.attribute(node, "maxOccurs")
+        .map_or(MaxOccurs::Bounded(1), |v| {
+            if v == "unbounded" {
+                MaxOccurs::Unbounded
+            } else {
+                MaxOccurs::Bounded(v.parse::<u32>().unwrap_or(1))
+            }
+        })
 }
 
 /// Parses `<xs:simpleContent>` within a complex type.
