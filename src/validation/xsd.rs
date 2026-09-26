@@ -1013,29 +1013,65 @@ fn resolve_attribute_groups(schema: &mut XsdSchema) {
         all_groups = expanded_groups;
     }
 
-    // Expand attributeGroup placeholders in complex type attributes
-    let expand_types = |types: &mut HashMap<String, XsdType>| {
-        for typ in types.values_mut() {
-            if let XsdType::Complex(ct) = typ {
-                let mut expanded = Vec::new();
-                let orig = std::mem::take(&mut ct.attributes);
-                for attr in orig {
-                    if attr.type_ref == "__attr_group__" {
-                        if let Some(group_attrs) = all_groups.get(&attr.name) {
-                            expanded.extend(group_attrs.clone());
-                            continue;
-                        }
-                    }
-                    expanded.push(attr);
-                }
-                ct.attributes = expanded;
+    // Expand attributeGroup placeholders in complex type attributes, in
+    // named types and in anonymous types of global and local elements.
+    for typ in schema.types.values_mut() {
+        expand_attr_groups_in_type(typ, &all_groups);
+    }
+    for decl in schema.elements.values_mut() {
+        expand_attr_groups_in_element(decl, &all_groups);
+    }
+    for imp in schema.imported_namespaces.values_mut() {
+        for typ in imp.types.values_mut() {
+            expand_attr_groups_in_type(typ, &all_groups);
+        }
+        for decl in imp.elements.values_mut() {
+            expand_attr_groups_in_element(decl, &all_groups);
+        }
+    }
+}
+
+fn expand_attr_groups_in_element(
+    decl: &mut XsdElement,
+    groups: &HashMap<String, Vec<XsdAttribute>>,
+) {
+    if let Some(inline) = decl.inline_type.as_mut() {
+        expand_attr_groups_in_type(inline, groups);
+    }
+}
+
+fn expand_attr_groups_in_type(typ: &mut XsdType, groups: &HashMap<String, Vec<XsdAttribute>>) {
+    let XsdType::Complex(ct) = typ else {
+        return;
+    };
+    let mut expanded = Vec::new();
+    for attr in std::mem::take(&mut ct.attributes) {
+        if attr.type_ref == "__attr_group__" {
+            if let Some(group_attrs) = groups.get(&attr.name) {
+                expanded.extend(group_attrs.clone());
+                continue;
             }
         }
-    };
+        expanded.push(attr);
+    }
+    ct.attributes = expanded;
+    expand_attr_groups_in_content(&mut ct.content, groups);
+}
 
-    expand_types(&mut schema.types);
-    for imp in schema.imported_namespaces.values_mut() {
-        expand_types(&mut imp.types);
+fn expand_attr_groups_in_content(
+    content: &mut ComplexContent,
+    groups: &HashMap<String, Vec<XsdAttribute>>,
+) {
+    let particles = match content {
+        ComplexContent::Sequence(p) | ComplexContent::Choice(p) | ComplexContent::All(p) => p,
+        ComplexContent::Empty | ComplexContent::SimpleContent { .. } => return,
+    };
+    for particle in particles {
+        match particle {
+            XsdParticle::Element(decl) => expand_attr_groups_in_element(decl, groups),
+            XsdParticle::Group(inner) => expand_attr_groups_in_content(inner, groups),
+            XsdParticle::Any(_) => {}
+        }
     }
 }
 
