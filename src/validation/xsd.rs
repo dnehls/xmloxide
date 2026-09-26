@@ -2602,7 +2602,7 @@ fn validate_complex_element_strict(
         }
         ComplexContent::SimpleContent { base } => {
             let text = doc.text_content(node);
-            if let Some(XsdType::Simple(st)) = schema.types.get(base.as_str()) {
+            if let Some(st) = resolve_simple_type(base, schema) {
                 validate_simple_value(
                     &text,
                     st,
@@ -2825,6 +2825,16 @@ fn resolve_element_type<'a>(decl: &'a XsdElement, schema: &'a XsdSchema) -> Opti
     None
 }
 
+/// Resolves a simple type by `QName` the way [`resolve_type_name`] resolves
+/// element types, so attribute, base, item and member types from imported
+/// namespaces are checked instead of falling through to the built-in check.
+fn resolve_simple_type<'a>(type_name: &str, schema: &'a XsdSchema) -> Option<&'a SimpleType> {
+    match resolve_type_name(type_name, schema) {
+        Some(XsdType::Simple(st)) => Some(st),
+        _ => None,
+    }
+}
+
 /// Resolves a type by name, checking local types first, then imported namespaces.
 fn resolve_type_name<'a>(type_name: &str, schema: &'a XsdSchema) -> Option<&'a XsdType> {
     // Try local types first (handles unprefixed names and xs:-stripped names)
@@ -2934,7 +2944,7 @@ fn validate_complex_element(
         }
         ComplexContent::SimpleContent { base } => {
             let text = doc.text_content(node);
-            if let Some(XsdType::Simple(st)) = schema.types.get(base.as_str()) {
+            if let Some(st) = resolve_simple_type(base, schema) {
                 validate_simple_value(&text, st, elem_name, schema, errors);
             }
         }
@@ -3778,7 +3788,8 @@ fn validate_simple_value(
     match &st.variety {
         SimpleTypeVariety::Builtin(name) => validate_builtin_value(value, name, context, errors),
         SimpleTypeVariety::Restriction { base, facets } => {
-            if let Some(XsdType::Simple(bt)) = schema.types.get(base.as_str()) {
+            if let Some(bt) = resolve_simple_type(base, schema).filter(|bt| !std::ptr::eq(*bt, st))
+            {
                 validate_simple_value(value, bt, context, schema, errors);
             } else {
                 validate_builtin_value(value, base, context, errors);
@@ -3787,7 +3798,9 @@ fn validate_simple_value(
         }
         SimpleTypeVariety::List { item_type } => {
             for item in value.split_whitespace() {
-                if let Some(XsdType::Simple(ist)) = schema.types.get(item_type.as_str()) {
+                if let Some(ist) =
+                    resolve_simple_type(item_type, schema).filter(|ist| !std::ptr::eq(*ist, st))
+                {
                     validate_simple_value(item, ist, context, schema, errors);
                 } else {
                     validate_builtin_value(item, item_type, context, errors);
@@ -3811,7 +3824,7 @@ fn validate_union_value(
     let mut any_valid = false;
     for mt in member_types {
         let mut trial = Vec::new();
-        if let Some(XsdType::Simple(mst)) = schema.types.get(mt.as_str()) {
+        if let Some(mst) = resolve_simple_type(mt, schema) {
             validate_simple_value(value, mst, context, schema, &mut trial);
         } else {
             validate_builtin_value(value, mt, context, &mut trial);
@@ -4323,7 +4336,7 @@ fn validate_attributes(
                 }
             }
             let attr_context = format!("{elem_name}/@{}", decl.name);
-            if let Some(XsdType::Simple(st)) = schema.types.get(&decl.type_ref) {
+            if let Some(st) = resolve_simple_type(&decl.type_ref, schema) {
                 validate_simple_value(&attr.value, st, &attr_context, schema, errors);
             } else {
                 validate_builtin_value(&attr.value, &decl.type_ref, &attr_context, errors);
@@ -4337,8 +4350,49 @@ fn validate_attributes(
 // ---------------------------------------------------------------------------
 
 /// Simple XSD pattern matching using basic character class support.
+///
+/// A pattern outside the subset the matcher understands is not checkable
+/// and counts as matched, so it is never reported as a violation.
 fn matches_xsd_pattern(value: &str, pattern: &str) -> bool {
-    match_pattern_chars(value.as_bytes(), pattern.as_bytes(), 0, 0)
+    !pattern_is_supported(pattern.as_bytes())
+        || match_pattern_chars(value.as_bytes(), pattern.as_bytes(), 0, 0)
+}
+
+/// Whether [`match_pattern_chars`] can evaluate `pattern`: ASCII literals,
+/// `.`, `\d`, `\w`, escaped metacharacters, character sets without escapes
+/// or subtraction, and the quantifiers `*`, `+`, `?`. Groups, alternation,
+/// counted quantifiers and every other escape are not supported.
+fn pattern_is_supported(pattern: &[u8]) -> bool {
+    if !pattern.is_ascii() {
+        return false;
+    }
+    let mut i = 0;
+    while i < pattern.len() {
+        match pattern[i] {
+            b'(' | b')' | b'|' | b'{' | b'}' | b']' => return false,
+            b'\\' => match pattern.get(i + 1) {
+                Some(
+                    b'd' | b'w' | b'\\' | b'|' | b'.' | b'-' | b'^' | b'?' | b'*' | b'+' | b'{'
+                    | b'}' | b'(' | b')' | b'[' | b']',
+                ) => i += 2,
+                _ => return false,
+            },
+            b'[' => {
+                let Some(len) = pattern[i + 1..].iter().position(|&c| c == b']') else {
+                    return false;
+                };
+                if pattern[i + 1..i + 1 + len]
+                    .iter()
+                    .any(|&c| c == b'\\' || c == b'[')
+                {
+                    return false;
+                }
+                i += len + 2;
+            }
+            _ => i += 1,
+        }
+    }
+    true
 }
 
 /// Recursive pattern matcher.
