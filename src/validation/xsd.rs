@@ -1187,17 +1187,17 @@ fn extension_base_key(ct: &ComplexType) -> Option<TypeKey> {
 /// Looks up a complex type by namespace and local name.
 ///
 /// Without a namespace the lookup falls back to [`find_complex_type`].
+/// A type in the target namespace may also sit in the imports: an import
+/// cycle back into the target namespace files it there.
 fn find_complex_type_by_key<'a>(key: &TypeKey, schema: &'a XsdSchema) -> Option<&'a ComplexType> {
     let (ns, local) = key;
     let Some(ns) = ns.as_deref() else {
         return find_complex_type(local, schema);
     };
-    let types = if schema.target_namespace.as_deref() == Some(ns) {
-        &schema.types
-    } else {
-        &schema.imported_namespaces.get(ns)?.types
-    };
-    match types.get(local) {
+    let own = (schema.target_namespace.as_deref() == Some(ns))
+        .then(|| schema.types.get(local))
+        .flatten();
+    match own.or_else(|| schema.imported_namespaces.get(ns)?.types.get(local)) {
         Some(XsdType::Complex(ct)) => Some(ct),
         _ => None,
     }
@@ -5708,6 +5708,54 @@ mod tests {
                 ),
             );
         }
+    }
+
+    #[test]
+    fn test_extension_base_in_own_namespace_found_in_imports() {
+        // The main schema is urn:a; its base type reaches it only through
+        // the import cycle a -> b -> base.xsd (urn:a), so it lands in
+        // imported_namespaces["urn:a"], not in schema.types.
+        let resolver = make_resolver(vec![
+            (
+                "b.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                            targetNamespace="urn:b" elementFormDefault="qualified">
+                    <xs:import namespace="urn:a" schemaLocation="base.xsd"/>
+                </xs:schema>"#,
+            ),
+            (
+                "base.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                            targetNamespace="urn:a" elementFormDefault="qualified">
+                    <xs:complexType name="BaseType"><xs:sequence>
+                        <xs:element name="inherited" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:schema>"#,
+            ),
+        ]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:a="urn:a" targetNamespace="urn:a"
+                        elementFormDefault="qualified">
+                <xs:import namespace="urn:b" schemaLocation="b.xsd"/>
+                <xs:complexType name="DerivedType"><xs:complexContent>
+                    <xs:extension base="a:BaseType"><xs:sequence>
+                        <xs:element name="own" type="xs:string"/>
+                    </xs:sequence></xs:extension>
+                </xs:complexContent></xs:complexType>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+        assert!(!schema.types.contains_key("BaseType"));
+        assert_eq!(
+            get_type_element_order("DerivedType", &schema),
+            Some(["inherited", "own"].map(String::from).to_vec()),
+        );
     }
 
     fn two_namespace_schema() -> XsdSchema {
