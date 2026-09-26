@@ -342,6 +342,14 @@ pub struct ComplexType {
     /// `None` when the qualified name has no resolvable namespace; the base is then
     /// looked up by local name alone.
     pub extension_base_namespace: Option<String>,
+    /// Base type name from `<xs:complexContent><xs:restriction base="...">`.
+    ///
+    /// A restriction inherits only the base's attribute uses, never its
+    /// content model (XSD 1.0 section 3.4.2).
+    pub restriction_base: Option<String>,
+    /// Namespace URI of [`restriction_base`](Self::restriction_base), resolved
+    /// like [`extension_base_namespace`](Self::extension_base_namespace).
+    pub restriction_base_namespace: Option<String>,
 }
 
 /// The content model of a complex type.
@@ -1062,8 +1070,25 @@ fn expand_attr_groups_in_type(typ: &mut XsdType, groups: &HashMap<String, Vec<Xs
         }
         expanded.push(attr);
     }
-    ct.attributes = expanded;
+    ct.attributes = apply_attribute_overrides(expanded);
     expand_attr_groups_in_content(&mut ct.content, groups);
+}
+
+/// Placeholder `type_ref` of a `use="prohibited"` attribute declaration.
+const PROHIBITED_ATTR: &str = "__prohibited__";
+
+/// Resolves attribute uses by name: a later declaration replaces an earlier
+/// one (a restriction's own declarations follow its base's), and a
+/// prohibited one removes it (XSD 1.0 section 3.4.2).
+fn apply_attribute_overrides(attrs: Vec<XsdAttribute>) -> Vec<XsdAttribute> {
+    let mut resolved: Vec<XsdAttribute> = Vec::with_capacity(attrs.len());
+    for attr in attrs {
+        resolved.retain(|a| a.name != attr.name);
+        if attr.type_ref != PROHIBITED_ATTR {
+            resolved.push(attr);
+        }
+    }
+    resolved
 }
 
 fn expand_attr_groups_in_content(
@@ -1119,6 +1144,20 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
         merge_type_extension(&mut schema.types, &type_name, base_particles, base_attrs);
     }
 
+    let main_restrictions: Vec<(String, TypeKey)> = schema
+        .types
+        .iter()
+        .filter_map(|(name, ty)| match ty {
+            XsdType::Complex(ct) => restriction_base_key(ct).map(|base| (name.clone(), base)),
+            XsdType::Simple(_) => None,
+        })
+        .collect();
+
+    for (type_name, base) in main_restrictions {
+        let base_attrs = resolve_base_attributes(&base, schema);
+        merge_type_restriction(&mut schema.types, &type_name, base_attrs);
+    }
+
     // Imported namespace extensions
     let imported_extensions: Vec<(String, String, TypeKey)> = schema
         .imported_namespaces
@@ -1143,6 +1182,43 @@ fn merge_extension_bases(schema: &mut XsdSchema) {
         if let Some(imp) = schema.imported_namespaces.get_mut(&ns) {
             merge_type_extension(&mut imp.types, &type_name, base_particles, base_attrs);
         }
+    }
+
+    let imported_restrictions: Vec<(String, String, TypeKey)> = schema
+        .imported_namespaces
+        .iter()
+        .flat_map(|(ns, imp)| {
+            imp.types.iter().filter_map(|(name, ty)| match ty {
+                XsdType::Complex(ct) => {
+                    restriction_base_key(ct).map(|base| (ns.clone(), name.clone(), base))
+                }
+                XsdType::Simple(_) => None,
+            })
+        })
+        .collect();
+
+    for (ns, type_name, base) in imported_restrictions {
+        let base_attrs = resolve_base_attributes(&base, schema);
+        if let Some(imp) = schema.imported_namespaces.get_mut(&ns) {
+            merge_type_restriction(&mut imp.types, &type_name, base_attrs);
+        }
+    }
+}
+
+/// Puts the base's attribute uses before the restriction's own; the
+/// restriction's redeclarations and prohibitions win in
+/// [`apply_attribute_overrides`]. The content model stays the restriction's.
+fn merge_type_restriction(
+    types: &mut HashMap<String, XsdType>,
+    type_name: &str,
+    base_attrs: Vec<XsdAttribute>,
+) {
+    if let Some(XsdType::Complex(ct)) = types.get_mut(type_name) {
+        let mut merged = base_attrs;
+        merged.append(&mut ct.attributes);
+        ct.attributes = merged;
+        ct.restriction_base = None;
+        ct.restriction_base_namespace = None;
     }
 }
 
@@ -1182,8 +1258,9 @@ fn merge_type_extension(
     }
 }
 
-/// Resolves a type's attributes, chasing extension chains.
-/// Returns all inherited attributes from the full type hierarchy.
+/// Resolves a type's attributes, chasing extension and restriction chains.
+/// Returns all inherited attributes from the full type hierarchy, base
+/// first; overrides are applied later by [`apply_attribute_overrides`].
 fn resolve_base_attributes(base: &TypeKey, schema: &XsdSchema) -> Vec<XsdAttribute> {
     resolve_base_attributes_impl(base, schema, &mut HashSet::new())
 }
@@ -1202,7 +1279,8 @@ fn resolve_base_attributes_impl(
     };
 
     // Recursively get base attributes first
-    let mut attrs = if let Some(base) = extension_base_key(ct) {
+    let mut attrs = if let Some(base) = extension_base_key(ct).or_else(|| restriction_base_key(ct))
+    {
         resolve_base_attributes_impl(&base, schema, visited)
     } else {
         Vec::new()
@@ -1228,6 +1306,12 @@ fn extension_base_key(ct: &ComplexType) -> Option<TypeKey> {
     let base = ct.extension_base.as_deref()?;
     let local = base.split_once(':').map_or(base, |(_, l)| l);
     Some((ct.extension_base_namespace.clone(), local.to_string()))
+}
+
+fn restriction_base_key(ct: &ComplexType) -> Option<TypeKey> {
+    let base = ct.restriction_base.as_deref()?;
+    let local = base.split_once(':').map_or(base, |(_, l)| l);
+    Some((ct.restriction_base_namespace.clone(), local.to_string()))
 }
 
 /// Looks up a complex type by namespace and local name.
@@ -1516,6 +1600,8 @@ fn parse_complex_type(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> Co
     let mut attributes = Vec::new();
     let mut extension_base: Option<String> = None;
     let mut extension_base_namespace: Option<String> = None;
+    let mut restriction_base: Option<String> = None;
+    let mut restriction_base_namespace: Option<String> = None;
 
     for child in doc.children(node) {
         let Some(child_name) = doc.node_name(child) else {
@@ -1556,11 +1642,17 @@ fn parse_complex_type(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> Co
                 collect_simple_content_attributes(doc, child, &mut attributes);
             }
             "complexContent" => {
-                let (base, ct, ext_attrs) = parse_complex_content(doc, child, ctx);
-                extension_base_namespace = base
+                let (base, is_restriction, ct, ext_attrs) = parse_complex_content(doc, child, ctx);
+                let base_namespace = base
                     .as_deref()
                     .and_then(|qname| qname_namespace(doc, child, qname, ctx));
-                extension_base = base;
+                if is_restriction {
+                    restriction_base = base;
+                    restriction_base_namespace = base_namespace;
+                } else {
+                    extension_base = base;
+                    extension_base_namespace = base_namespace;
+                }
                 content = ct;
                 attributes.extend(ext_attrs);
             }
@@ -1574,20 +1666,22 @@ fn parse_complex_type(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> Co
         mixed,
         extension_base,
         extension_base_namespace,
+        restriction_base,
+        restriction_base_namespace,
     }
 }
 
-/// Parses `<xs:complexContent><xs:extension base="...">`.
+/// Parses `<xs:complexContent>` with an `<xs:extension>` or `<xs:restriction>`.
 ///
-/// Returns `(base_type_name, content_model, extra_attributes)`.
-/// The content model contains only the extension's own particles;
+/// Returns `(base_type_name, is_restriction, content_model, extra_attributes)`.
+/// The content model contains only the derivation's own particles;
 /// base-type merging is done in [`merge_extension_bases`].
 #[allow(clippy::too_many_lines)]
 fn parse_complex_content(
     doc: &Document,
     cc_node: NodeId,
     ctx: &DeclContext<'_>,
-) -> (Option<String>, ComplexContent, Vec<XsdAttribute>) {
+) -> (Option<String>, bool, ComplexContent, Vec<XsdAttribute>) {
     let mut base = None;
     let mut content = ComplexContent::Empty;
     let mut attributes = Vec::new();
@@ -1640,7 +1734,7 @@ fn parse_complex_content(
             }
             "restriction" => {
                 // restriction replaces the base content model entirely
-                let _base = doc.attribute(cc_child, "base").map(String::from);
+                let base = doc.attribute(cc_child, "base").map(String::from);
                 for restr_child in doc.children(cc_child) {
                     let Some(restr_name) = doc.node_name(restr_child) else {
                         continue;
@@ -1680,13 +1774,14 @@ fn parse_complex_content(
                         _ => {}
                     }
                 }
-                // Restriction replaces the base content model, so no extension_base
-                return (None, content, attributes);
+                // Restriction replaces the base content model but keeps its
+                // attribute uses, so the base is kept apart from extension_base.
+                return (base, true, content, attributes);
             }
             _ => {}
         }
     }
-    (base, content, attributes)
+    (base, false, content, attributes)
 }
 
 /// Collects attribute declarations from `<xs:simpleContent>` extension children.
@@ -2017,6 +2112,11 @@ fn parse_attribute_decl(doc: &Document, node: NodeId) -> Option<XsdAttribute> {
     };
     let required = doc.attribute(node, "use") == Some("required");
     let fixed = doc.attribute(node, "fixed").map(String::from);
+    let type_ref = if doc.attribute(node, "use") == Some("prohibited") {
+        PROHIBITED_ATTR.to_string()
+    } else {
+        type_ref
+    };
     Some(XsdAttribute {
         name,
         type_ref,
