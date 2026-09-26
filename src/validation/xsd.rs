@@ -351,8 +351,16 @@ pub enum ComplexContent {
     Empty,
     /// An ordered sequence of particles, all of which must appear in order.
     Sequence(Vec<XsdParticle>),
-    /// A choice among particles, exactly one of which must appear.
-    Choice(Vec<XsdParticle>),
+    /// A choice among particles; one alternative per round, repeated
+    /// `min_occurs`..`max_occurs` times (XSD 1.0 §3.8).
+    Choice {
+        /// The alternatives.
+        particles: Vec<XsdParticle>,
+        /// Minimum number of rounds (default 1).
+        min_occurs: u32,
+        /// Maximum number of rounds (default 1).
+        max_occurs: MaxOccurs,
+    },
     /// An unordered collection where each particle may appear at most once.
     All(Vec<XsdParticle>),
     /// Simple content (text only) derived from a base type.
@@ -1063,7 +1071,9 @@ fn expand_attr_groups_in_content(
     groups: &HashMap<String, Vec<XsdAttribute>>,
 ) {
     let particles = match content {
-        ComplexContent::Sequence(p) | ComplexContent::Choice(p) | ComplexContent::All(p) => p,
+        ComplexContent::Sequence(p)
+        | ComplexContent::Choice { particles: p, .. }
+        | ComplexContent::All(p) => p,
         ComplexContent::Empty | ComplexContent::SimpleContent { .. } => return,
     };
     for particle in particles {
@@ -1153,7 +1163,7 @@ fn merge_type_extension(
             ComplexContent::Empty => {
                 ct.content = ComplexContent::Sequence(base_particles);
             }
-            ComplexContent::Choice(_) | ComplexContent::All(_) => {
+            ComplexContent::Choice { .. } | ComplexContent::All(_) => {
                 let mut merged = base_particles;
                 let existing = ct.content.clone();
                 merged.push(XsdParticle::Group(existing));
@@ -1282,8 +1292,8 @@ fn resolve_base_particles_impl(
     match &ct.content {
         ComplexContent::Sequence(p) => particles.extend(p.iter().cloned()),
         ComplexContent::Empty | ComplexContent::SimpleContent { .. } => {}
-        ComplexContent::Choice(p) => {
-            particles.push(XsdParticle::Group(ComplexContent::Choice(p.clone())));
+        ComplexContent::Choice { .. } => {
+            particles.push(XsdParticle::Group(ct.content.clone()));
         }
         ComplexContent::All(p) => {
             particles.push(XsdParticle::Group(ComplexContent::All(p.clone())));
@@ -1834,7 +1844,9 @@ fn parse_compositor(
     }
     // For single-element compositor groups, group maxOccurs can be safely
     // propagated to the child element (A repeated N times == element A maxOccurs=N).
-    if particles.len() == 1 {
+    // A choice keeps its own occurrences instead; propagating them as well
+    // would count every repetition twice.
+    if particles.len() == 1 && !matches!(kind, CompositorKind::Choice) {
         if let XsdParticle::Element(elem) = &mut particles[0] {
             match compositor_max {
                 MaxOccurs::Bounded(n) if n > 1 => elem.max_occurs = MaxOccurs::Bounded(n),
@@ -1846,7 +1858,11 @@ fn parse_compositor(
 
     match kind {
         CompositorKind::Sequence => ComplexContent::Sequence(particles),
-        CompositorKind::Choice => ComplexContent::Choice(particles),
+        CompositorKind::Choice => ComplexContent::Choice {
+            particles,
+            min_occurs: compositor_min,
+            max_occurs: compositor_max,
+        },
         CompositorKind::All => ComplexContent::All(particles),
     }
 }
@@ -2178,7 +2194,7 @@ fn extract_element_names(content: &ComplexContent) -> Option<Vec<String>> {
             }
             Some(names)
         }
-        ComplexContent::Choice(particles) => {
+        ComplexContent::Choice { particles, .. } => {
             // For choice, collect all element names
             let mut names = Vec::new();
             for p in particles {
@@ -2451,15 +2467,24 @@ fn validate_complex_element_strict(
                 true,
             );
         }
-        ComplexContent::Choice(p) => {
+        ComplexContent::Choice {
+            particles,
+            min_occurs,
+            max_occurs,
+        } => {
             let ce = collect_child_elements(doc, node);
-            validate_choice(
+            let _ = validate_choice(
                 doc,
                 &ce,
-                p,
+                &ChoiceGroup {
+                    particles,
+                    min_occurs: *min_occurs,
+                    max_occurs: max_occurs.clone(),
+                },
                 doc.node_name(node).unwrap_or("<unknown>"),
                 schema,
                 errors,
+                true,
                 true,
             );
         }
@@ -2622,10 +2647,24 @@ fn validate_group_content_strict(
         ComplexContent::Sequence(particles) => {
             validate_sequence_strict(doc, children, particles, parent_name, schema, errors, false)
         }
-        ComplexContent::Choice(particles) => {
-            validate_choice(doc, children, particles, parent_name, schema, errors, true);
-            children.len()
-        }
+        ComplexContent::Choice {
+            particles,
+            min_occurs,
+            max_occurs,
+        } => validate_choice(
+            doc,
+            children,
+            &ChoiceGroup {
+                particles,
+                min_occurs: *min_occurs,
+                max_occurs: max_occurs.clone(),
+            },
+            parent_name,
+            schema,
+            errors,
+            true,
+            false,
+        ),
         ComplexContent::All(particles) => {
             validate_all(doc, children, particles, parent_name, schema, errors);
             children.len()
@@ -2767,9 +2806,26 @@ fn validate_complex_element(
             let ce = collect_child_elements(doc, node);
             validate_sequence(doc, &ce, p, elem_name, schema, errors, true);
         }
-        ComplexContent::Choice(p) => {
+        ComplexContent::Choice {
+            particles,
+            min_occurs,
+            max_occurs,
+        } => {
             let ce = collect_child_elements(doc, node);
-            validate_choice(doc, &ce, p, elem_name, schema, errors, false);
+            let _ = validate_choice(
+                doc,
+                &ce,
+                &ChoiceGroup {
+                    particles,
+                    min_occurs: *min_occurs,
+                    max_occurs: max_occurs.clone(),
+                },
+                elem_name,
+                schema,
+                errors,
+                false,
+                true,
+            );
         }
         ComplexContent::All(p) => {
             let ce = collect_child_elements(doc, node);
@@ -3032,7 +3088,7 @@ fn matches_later_group(
         ComplexContent::Sequence(particles) | ComplexContent::All(particles) => {
             matches_later_particle(doc, child, particles, schema)
         }
-        ComplexContent::Choice(particles) => {
+        ComplexContent::Choice { particles, .. } => {
             for particle in particles {
                 match particle {
                     XsdParticle::Element(decl) => {
@@ -3210,10 +3266,24 @@ fn validate_group_content(
         ComplexContent::Sequence(particles) => {
             validate_sequence(doc, children, particles, parent_name, schema, errors, false)
         }
-        ComplexContent::Choice(particles) => {
-            validate_choice(doc, children, particles, parent_name, schema, errors, false);
-            usize::from(!children.is_empty())
-        }
+        ComplexContent::Choice {
+            particles,
+            min_occurs,
+            max_occurs,
+        } => validate_choice(
+            doc,
+            children,
+            &ChoiceGroup {
+                particles,
+                min_occurs: *min_occurs,
+                max_occurs: max_occurs.clone(),
+            },
+            parent_name,
+            schema,
+            errors,
+            false,
+            false,
+        ),
         _ => 0,
     }
 }
@@ -3356,107 +3426,159 @@ fn validate_children_laxly(
     }
 }
 
-/// Validates a choice content model.
+/// A choice group with its occurrences, borrowed from
+/// [`ComplexContent::Choice`].
+struct ChoiceGroup<'a> {
+    particles: &'a [XsdParticle],
+    min_occurs: u32,
+    max_occurs: MaxOccurs,
+}
+
+/// Validates a choice content model, returning the children consumed.
 ///
-/// `strict` selects the strict API's rules for wildcard matches.
+/// Each round picks the alternative the next child starts (the Unique
+/// Particle Attribution constraint, XSD 1.0 §3.8.6, makes that choice
+/// unambiguous) and validates it with the alternative's own occurrences.
+/// Rounds repeat up to `max_occurs`; fewer than `min_occurs` rounds is an
+/// error unless an alternative can be empty. `strict` selects the strict
+/// API's rules for wildcard matches; `report_unexpected` reports children
+/// left over after the last round.
+#[allow(clippy::too_many_arguments)]
 fn validate_choice(
     doc: &Document,
     children: &[NodeId],
-    particles: &[XsdParticle],
+    choice: &ChoiceGroup<'_>,
     parent_name: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
     strict: bool,
-) {
-    if children.is_empty() {
-        let any_optional = particles
+    report_unexpected: bool,
+) -> usize {
+    let mut idx = 0;
+    let mut rounds: u32 = 0;
+    // Rounds the consumed children could be split into, for `min_occurs`:
+    // `j` repetitions of an element with `minOccurs = p` fill `j / p` rounds.
+    let mut min_rounds: u32 = 0;
+    while idx < children.len() {
+        if let MaxOccurs::Bounded(max) = choice.max_occurs {
+            if rounds >= max {
+                break;
+            }
+        }
+        let child = children[idx];
+        let Some(particle) = choice
+            .particles
             .iter()
-            .any(|p| matches!(p, XsdParticle::Element(d) if d.min_occurs == 0));
-        if !any_optional {
+            .find(|p| choice_particle_matches(doc, child, p, schema))
+        else {
+            break;
+        };
+        let rest = &children[idx..];
+        let (consumed, splits) = match particle {
+            XsdParticle::Element(decl) => {
+                let n = validate_sequence_element(doc, rest, decl, parent_name, schema, errors);
+                (n, n / decl.min_occurs.max(1) as usize)
+            }
+            XsdParticle::Any(any) => {
+                let n =
+                    validate_any_wildcard_impl(doc, rest, any, parent_name, schema, errors, strict);
+                (n, n / any.min_occurs.max(1) as usize)
+            }
+            XsdParticle::Group(content) => {
+                let n = validate_group_content(doc, rest, content, parent_name, schema, errors);
+                (n, 1)
+            }
+        };
+        if consumed == 0 {
+            break;
+        }
+        idx += consumed;
+        rounds += 1;
+        min_rounds = min_rounds.saturating_add(u32::try_from(splits.max(1)).unwrap_or(u32::MAX));
+    }
+
+    let mut unexpected_from = idx;
+    if min_rounds < choice.min_occurs && !choice.particles.iter().any(particle_emptiable) {
+        if rounds == 0 && idx < children.len() {
+            let first_name = doc.node_name(children[idx]).unwrap_or("");
+            let choices: Vec<&str> = choice
+                .particles
+                .iter()
+                .filter_map(|p| {
+                    if let XsdParticle::Element(d) = p {
+                        Some(d.name.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            errors.push(ValidationError {
+                message: format!("element <{first_name}> in <{parent_name}> does not match any choice alternative; expected one of: {}", choices.join(", ")),
+                line: None, column: None,
+            });
+            unexpected_from += 1;
+        } else if rounds == 0 {
             errors.push(ValidationError {
                 message: format!("element <{parent_name}> requires one of the choice alternatives but has no child elements"),
                 line: None, column: None,
             });
+        } else {
+            errors.push(ValidationError {
+                message: format!(
+                    "element <{parent_name}> requires at least {} occurrence(s) of the choice, found {min_rounds}",
+                    choice.min_occurs
+                ),
+                line: None,
+                column: None,
+            });
         }
-        return;
     }
-    let first = children[0];
-    let first_name = doc.node_name(first).unwrap_or("");
-    let matched = particles.iter().any(|p| {
-        match p {
-            XsdParticle::Element(decl) => {
-                if element_matches_decl(doc, first, decl, schema) {
-                    let effective = effective_decl(doc, first, decl, schema);
-                    validate_element(doc, first, effective, schema, errors);
-                    return true;
-                }
-                false
-            }
-            XsdParticle::Any(any) => {
-                if !wildcard_allows(any, doc.node_namespace(first)) {
-                    return false;
-                }
-                validate_wildcard_child(doc, first, any, parent_name, schema, errors, strict);
-                true
-            }
-            XsdParticle::Group(ct) => {
-                // Try to match the first child against the group's
-                // content model (handles sequences/choices nested in choice)
-                match ct {
-                    ComplexContent::Sequence(seq_particles) => {
-                        if let Some(XsdParticle::Element(decl)) = seq_particles.first() {
-                            if element_matches_decl(doc, first, decl, schema) {
-                                // Validate the entire sequence against children
-                                validate_sequence(
-                                    doc,
-                                    children,
-                                    seq_particles,
-                                    parent_name,
-                                    schema,
-                                    errors,
-                                    true,
-                                );
-                                return true;
-                            }
-                        }
-                    }
-                    ComplexContent::Choice(choice_particles) => {
-                        // Recurse: try to match child against choice alternatives
-                        let mut sub_errors = Vec::new();
-                        validate_choice(
-                            doc,
-                            children,
-                            choice_particles,
-                            parent_name,
-                            schema,
-                            &mut sub_errors,
-                            strict,
-                        );
-                        if sub_errors.is_empty() {
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
-                false
-            }
+    if report_unexpected {
+        for &child in children.iter().skip(unexpected_from) {
+            let name = doc.node_name(child).unwrap_or("<unknown>");
+            errors.push(ValidationError {
+                message: format!("unexpected element <{name}> in <{parent_name}>; not expected by the content model"),
+                line: None, column: None,
+            });
         }
-    });
-    if !matched {
-        let choices: Vec<&str> = particles
-            .iter()
-            .filter_map(|p| {
-                if let XsdParticle::Element(d) = p {
-                    Some(d.name.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        errors.push(ValidationError {
-            message: format!("element <{first_name}> in <{parent_name}> does not match any choice alternative; expected one of: {}", choices.join(", ")),
-            line: None, column: None,
-        });
+    }
+    idx
+}
+
+/// Whether `child` starts the choice alternative `particle`, without
+/// validating anything.
+fn choice_particle_matches(
+    doc: &Document,
+    child: NodeId,
+    particle: &XsdParticle,
+    schema: &XsdSchema,
+) -> bool {
+    match particle {
+        XsdParticle::Element(decl) => element_matches_decl(doc, child, decl, schema),
+        XsdParticle::Any(any) => wildcard_allows(any, doc.node_namespace(child)),
+        XsdParticle::Group(content) => matches_later_group(doc, child, content, schema),
+    }
+}
+
+/// Whether a particle can match an empty sequence of children.
+fn particle_emptiable(particle: &XsdParticle) -> bool {
+    match particle {
+        XsdParticle::Element(decl) => decl.min_occurs == 0,
+        XsdParticle::Any(any) => any.min_occurs == 0,
+        XsdParticle::Group(content) => content_emptiable(content),
+    }
+}
+
+/// Whether a content model can match an empty sequence of children.
+fn content_emptiable(content: &ComplexContent) -> bool {
+    match content {
+        ComplexContent::Empty | ComplexContent::SimpleContent { .. } => true,
+        ComplexContent::Sequence(p) | ComplexContent::All(p) => p.iter().all(particle_emptiable),
+        ComplexContent::Choice {
+            particles,
+            min_occurs,
+            ..
+        } => *min_occurs == 0 || particles.iter().any(particle_emptiable),
     }
 }
 
