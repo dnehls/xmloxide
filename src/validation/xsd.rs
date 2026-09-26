@@ -2497,6 +2497,7 @@ fn validate_complex_element_strict(
                 doc.node_name(node).unwrap_or("<unknown>"),
                 schema,
                 errors,
+                true,
             );
         }
         ComplexContent::SimpleContent { base } => {
@@ -2666,7 +2667,7 @@ fn validate_group_content_strict(
             false,
         ),
         ComplexContent::All(particles) => {
-            validate_all(doc, children, particles, parent_name, schema, errors);
+            validate_all(doc, children, particles, parent_name, schema, errors, true);
             children.len()
         }
         _ => 0,
@@ -2829,7 +2830,7 @@ fn validate_complex_element(
         }
         ComplexContent::All(p) => {
             let ce = collect_child_elements(doc, node);
-            validate_all(doc, &ce, p, elem_name, schema, errors);
+            validate_all(doc, &ce, p, elem_name, schema, errors, false);
         }
         ComplexContent::SimpleContent { base } => {
             let text = doc.text_content(node);
@@ -2903,6 +2904,7 @@ fn validate_sequence(
                     parent_name,
                     schema,
                     errors,
+                    false,
                 );
                 idx += consumed;
 
@@ -3206,7 +3208,8 @@ fn is_substitution_member(child_name: &str, decl: &XsdElement, schema: &XsdSchem
     false
 }
 
-/// Validates a single element particle in a sequence, returning number consumed.
+/// Validates a single element particle in a sequence, returning number
+/// consumed; `strict` validates each match with the strict API's rules.
 fn validate_sequence_element(
     doc: &Document,
     children: &[NodeId],
@@ -3214,6 +3217,7 @@ fn validate_sequence_element(
     parent_name: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
+    strict: bool,
 ) -> usize {
     let mut count: u32 = 0;
     let mut consumed = 0;
@@ -3230,13 +3234,12 @@ fn validate_sequence_element(
         // When substitution groups are involved, the instance element may
         // differ from the schema declaration; we need the instance element's
         // own type for correct content validation.
-        validate_element(
-            doc,
-            child,
-            effective_decl(doc, child, decl, schema),
-            schema,
-            errors,
-        );
+        let effective = effective_decl(doc, child, decl, schema);
+        if strict {
+            validate_element_strict(doc, child, effective, schema, errors);
+        } else {
+            validate_element(doc, child, effective, schema, errors);
+        }
         count += 1;
         consumed += 1;
     }
@@ -3476,7 +3479,8 @@ fn validate_choice(
         let rest = &children[idx..];
         let (consumed, splits) = match particle {
             XsdParticle::Element(decl) => {
-                let n = validate_sequence_element(doc, rest, decl, parent_name, schema, errors);
+                let n =
+                    validate_sequence_element(doc, rest, decl, parent_name, schema, errors, strict);
                 (n, n / decl.min_occurs.max(1) as usize)
             }
             XsdParticle::Any(any) => {
@@ -3485,7 +3489,11 @@ fn validate_choice(
                 (n, n / any.min_occurs.max(1) as usize)
             }
             XsdParticle::Group(content) => {
-                let n = validate_group_content(doc, rest, content, parent_name, schema, errors);
+                let n = if strict {
+                    validate_group_content_strict(doc, rest, content, parent_name, schema, errors)
+                } else {
+                    validate_group_content(doc, rest, content, parent_name, schema, errors)
+                };
                 (n, 1)
             }
         };
@@ -3582,7 +3590,8 @@ fn content_emptiable(content: &ComplexContent) -> bool {
     }
 }
 
-/// Validates an `all` content model.
+/// Validates an `all` content model; `strict` validates each member with
+/// the strict API's rules.
 fn validate_all(
     doc: &Document,
     children: &[NodeId],
@@ -3590,6 +3599,7 @@ fn validate_all(
     parent_name: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
+    strict: bool,
 ) {
     let mut seen: HashMap<&str, u32> = HashMap::new();
     for &child in children {
@@ -3608,7 +3618,12 @@ fn validate_all(
                     });
                 }
             }
-            validate_element(doc, child, decl, schema, errors);
+            let effective = effective_decl(doc, child, decl, schema);
+            if strict {
+                validate_element_strict(doc, child, effective, schema, errors);
+            } else {
+                validate_element(doc, child, effective, schema, errors);
+            }
         } else {
             errors.push(ValidationError {
                 message: format!("unexpected element <{child_name}> in <{parent_name}>; not declared in the all group"),

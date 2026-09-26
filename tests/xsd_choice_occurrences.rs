@@ -41,6 +41,24 @@ const XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
       </xs:choice>
     </xs:complexType>
   </xs:element>
+  <xs:element name="Pick">
+    <xs:complexType>
+      <xs:choice>
+        <xs:element name="a" type="xs:string"/>
+        <xs:sequence>
+          <xs:element name="b" type="xs:string"/>
+          <xs:element name="c" type="xs:string"/>
+        </xs:sequence>
+      </xs:choice>
+    </xs:complexType>
+  </xs:element>
+  <xs:element name="Every">
+    <xs:complexType>
+      <xs:all>
+        <xs:element name="a" type="xs:string"/>
+      </xs:all>
+    </xs:complexType>
+  </xs:element>
 </xs:schema>"#;
 
 fn errors(xml: &str, strict: bool) -> Vec<String> {
@@ -90,4 +108,25 @@ fn repeated_choice_element_counts_rounds() {
     assert_valid(r#"<Seg xmlns="urn:t"><pos>1</pos><pos>2</pos><pos>3</pos><pos>4</pos></Seg>"#);
     assert_valid(r#"<Seg xmlns="urn:t"><posList>1 2 3 4</posList></Seg>"#);
     assert_invalid(r#"<Seg xmlns="urn:t"><pos>1</pos></Seg>"#);
+}
+
+/// Strict mode rejects an undeclared attribute (cvc-complex-type.3.2.2);
+/// lax ignores attributes it has no declaration for. A choice member must
+/// not drop strict mode for its subtree.
+#[test]
+fn strict_checks_attributes_of_choice_member() {
+    for xml in [
+        r#"<Pick xmlns="urn:t"><a foo="1">x</a></Pick>"#,
+        r#"<Pick xmlns="urn:t"><b foo="1">x</b><c>y</c></Pick>"#,
+    ] {
+        assert_eq!(errors(xml, false), Vec::<String>::new(), "lax: {xml}");
+        assert!(!errors(xml, true).is_empty(), "strict accepted {xml}");
+    }
+}
+
+#[test]
+fn strict_checks_all_group_member() {
+    let xml = r#"<Every xmlns="urn:t"><a foo="1">x</a></Every>"#;
+    assert_eq!(errors(xml, false), Vec::<String>::new(), "lax: {xml}");
+    assert!(!errors(xml, true).is_empty(), "strict accepted {xml}");
 }
