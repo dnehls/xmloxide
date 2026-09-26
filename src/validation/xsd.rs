@@ -4158,7 +4158,27 @@ fn choice_particle_matches(
     match particle {
         XsdParticle::Element(decl) => element_matches_decl(doc, child, decl, schema),
         XsdParticle::Any(any) => wildcard_allows(any, doc.node_namespace(child)),
-        XsdParticle::Group(content) => matches_later_group(doc, child, content, schema),
+        XsdParticle::Group(content) => content_starts_with(doc, child, content, schema),
+    }
+}
+
+/// Whether `child` can be the first child `content` consumes. Unlike
+/// [`matches_later_group`], a sequence's later members do not count: an
+/// element that only fits the second member of a group cannot begin it.
+fn content_starts_with(
+    doc: &Document,
+    child: NodeId,
+    content: &ComplexContent,
+    schema: &XsdSchema,
+) -> bool {
+    match content {
+        ComplexContent::Empty | ComplexContent::SimpleContent { .. } => false,
+        ComplexContent::Sequence { particles, .. } => {
+            sequence_starts_with(doc, child, particles, schema)
+        }
+        ComplexContent::Choice { particles, .. } | ComplexContent::All(particles) => particles
+            .iter()
+            .any(|p| choice_particle_matches(doc, child, p, schema)),
     }
 }
 

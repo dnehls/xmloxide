@@ -13,6 +13,11 @@ const XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
       <xs:element name="b" type="xs:string"/>
     </xs:sequence>
   </xs:group>
+  <xs:group name="W">
+    <xs:sequence>
+      <xs:group ref="t:AB"/>
+    </xs:sequence>
+  </xs:group>
   <xs:complexType name="SeqRepType">
     <xs:sequence maxOccurs="unbounded">
       <xs:element name="a" type="xs:string"/>
@@ -47,12 +52,41 @@ const XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
       <xs:element name="c" type="xs:string"/>
     </xs:sequence>
   </xs:complexType>
+  <xs:complexType name="NestType">
+    <xs:sequence>
+      <xs:sequence maxOccurs="2">
+        <xs:sequence>
+          <xs:element name="a" type="xs:string"/>
+          <xs:element name="b" type="xs:string"/>
+        </xs:sequence>
+      </xs:sequence>
+      <xs:element name="b" type="xs:string" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="NestGrpType">
+    <xs:sequence>
+      <xs:group ref="t:W" maxOccurs="unbounded"/>
+      <xs:element name="b" type="xs:string" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="NestChoiceType">
+    <xs:sequence>
+      <xs:choice maxOccurs="unbounded">
+        <xs:group ref="t:AB"/>
+        <xs:element name="c" type="xs:string"/>
+      </xs:choice>
+      <xs:element name="b" type="xs:string" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
   <xs:element name="SeqRep" type="t:SeqRepType"/>
   <xs:element name="SeqTwo" type="t:SeqTwoType"/>
   <xs:element name="GrpRep" type="t:GrpRepType"/>
   <xs:element name="GrpTwo" type="t:GrpTwoType"/>
   <xs:element name="GrpOpt" type="t:GrpOptType"/>
   <xs:element name="GrpReq" type="t:GrpReqType"/>
+  <xs:element name="Nest" type="t:NestType"/>
+  <xs:element name="NestGrp" type="t:NestGrpType"/>
+  <xs:element name="NestChoice" type="t:NestChoiceType"/>
 </xs:schema>"#;
 
 const THREE_ROUNDS: &str = "<a>1</a><b>2</b><a>3</a><b>4</b><a>5</a><b>6</b>";
@@ -106,4 +140,23 @@ fn optional_group_ref_absent_valid() {
 #[test]
 fn required_group_ref_missing_invalid() {
     assert_invalid(r#"<GrpReq xmlns="urn:t"><c>1</c></GrpReq>"#);
+}
+
+// A further round starts only with a child the repeated group can begin
+// with. The trailing <b> matches the second member of the inner group,
+// not its first, so it belongs to the optional <b> after the repetition.
+
+#[test]
+fn nested_sequence_round_needs_first_member() {
+    assert_valid(r#"<Nest xmlns="urn:t"><a>1</a><b>2</b><b>3</b></Nest>"#);
+}
+
+#[test]
+fn group_ref_in_group_ref_round_needs_first_member() {
+    assert_valid(r#"<NestGrp xmlns="urn:t"><a>1</a><b>2</b><b>3</b></NestGrp>"#);
+}
+
+#[test]
+fn choice_round_group_alternative_needs_first_member() {
+    assert_valid(r#"<NestChoice xmlns="urn:t"><a>1</a><b>2</b><b>3</b></NestChoice>"#);
 }
