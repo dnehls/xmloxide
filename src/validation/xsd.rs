@@ -3978,11 +3978,11 @@ fn validate_choice(
     // `j` repetitions of an element with `minOccurs = p` fill `j / p` rounds.
     let mut min_rounds: u32 = 0;
     while idx < children.len() {
-        if let MaxOccurs::Bounded(max) = choice.max_occurs {
-            if rounds >= max {
-                break;
-            }
-        }
+        let rounds_left = match choice.max_occurs {
+            MaxOccurs::Bounded(max) if rounds >= max => break,
+            MaxOccurs::Bounded(max) => Some(max - rounds),
+            MaxOccurs::Unbounded => None,
+        };
         let child = children[idx];
         let Some(particle) = choice
             .particles
@@ -3992,16 +3992,23 @@ fn validate_choice(
             break;
         };
         let rest = &children[idx..];
-        let (consumed, splits) = match particle {
-            XsdParticle::Element(decl) => {
-                let n =
-                    validate_sequence_element(doc, rest, decl, parent_name, schema, errors, strict);
-                (n, n / decl.min_occurs.max(1) as usize)
-            }
+        // (children consumed, fewest rounds they take, most rounds they fill)
+        let (consumed, fewest, most) = match particle {
+            XsdParticle::Element(decl) => validate_choice_element(
+                doc,
+                rest,
+                decl,
+                rounds_left,
+                parent_name,
+                schema,
+                errors,
+                strict,
+            ),
             XsdParticle::Any(any) => {
                 let n =
                     validate_any_wildcard_impl(doc, rest, any, parent_name, schema, errors, strict);
-                (n, n / any.min_occurs.max(1) as usize)
+                let splits = n / any.min_occurs.max(1) as usize;
+                (n, 1, u32::try_from(splits.max(1)).unwrap_or(u32::MAX))
             }
             XsdParticle::Group(content) => {
                 let n = if strict {
@@ -4009,15 +4016,15 @@ fn validate_choice(
                 } else {
                     validate_group_content(doc, rest, content, parent_name, schema, errors)
                 };
-                (n, 1)
+                (n, 1, 1)
             }
         };
         if consumed == 0 {
             break;
         }
         idx += consumed;
-        rounds += 1;
-        min_rounds = min_rounds.saturating_add(u32::try_from(splits.max(1)).unwrap_or(u32::MAX));
+        rounds += fewest;
+        min_rounds = min_rounds.saturating_add(most.min(rounds_left.unwrap_or(u32::MAX)));
     }
 
     let mut unexpected_from = idx;
@@ -4066,6 +4073,78 @@ fn validate_choice(
         }
     }
     idx
+}
+
+/// Validates the run of children matching the choice alternative `decl`,
+/// which may span several rounds of the choice.
+///
+/// `n` repetitions of an element with occurrences `p..q` split into `k`
+/// rounds iff `k * p <= n <= k * q`, so the run is taken whole, up to
+/// `rounds_left * q` children, instead of greedily per round. Returns the
+/// children consumed, the fewest rounds they take (`ceil(n / q)`) and the
+/// most they can fill (`n / p`); an error when no `k` fits.
+#[allow(clippy::too_many_arguments)]
+fn validate_choice_element(
+    doc: &Document,
+    children: &[NodeId],
+    decl: &XsdElement,
+    rounds_left: Option<u32>,
+    parent_name: &str,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+    strict: bool,
+) -> (usize, u32, u32) {
+    let limit = match (&decl.max_occurs, rounds_left) {
+        (MaxOccurs::Bounded(q), Some(k)) => Some(u64::from(*q) * u64::from(k)),
+        _ => None,
+    };
+    let mut n: u32 = 0;
+    for &child in children {
+        if limit.is_some_and(|l| u64::from(n) >= l)
+            || !element_matches_decl(doc, child, decl, schema)
+        {
+            break;
+        }
+        let effective = effective_decl(doc, child, decl, schema);
+        if strict {
+            validate_element_strict(doc, child, effective, schema, errors);
+        } else {
+            validate_element(doc, child, effective, schema, errors);
+        }
+        n += 1;
+    }
+    if n == 0 {
+        return (0, 0, 0);
+    }
+    let p = decl.min_occurs;
+    let fewest = match decl.max_occurs {
+        MaxOccurs::Bounded(q) => n.div_ceil(q.max(1)),
+        MaxOccurs::Unbounded => 1,
+    };
+    let most = n.checked_div(p).unwrap_or(u32::MAX);
+    if fewest > most {
+        let message = if n < p {
+            format!(
+                "element <{parent_name}> requires at least {p} occurrence(s) of <{}>, found {n}",
+                decl.name
+            )
+        } else {
+            let q = match decl.max_occurs {
+                MaxOccurs::Bounded(q) => q.to_string(),
+                MaxOccurs::Unbounded => "unbounded".to_string(),
+            };
+            format!(
+                "element <{parent_name}> cannot split {n} occurrence(s) of <{}> into choice rounds of {p} to {q}",
+                decl.name
+            )
+        };
+        errors.push(ValidationError {
+            message,
+            line: None,
+            column: None,
+        });
+    }
+    (n as usize, fewest, most)
 }
 
 /// Whether `child` starts the choice alternative `particle`, without

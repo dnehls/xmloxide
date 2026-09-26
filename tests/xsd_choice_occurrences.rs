@@ -52,6 +52,12 @@ const XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
       </xs:choice>
     </xs:complexType>
   </xs:element>
+  <xs:complexType name="SplitType">
+    <xs:choice minOccurs="2" maxOccurs="2">
+      <xs:element name="a" type="xs:string" minOccurs="2" maxOccurs="4"/>
+    </xs:choice>
+  </xs:complexType>
+  <xs:element name="Split" type="t:SplitType"/>
   <xs:element name="Every">
     <xs:complexType>
       <xs:all>
@@ -129,4 +135,15 @@ fn strict_checks_all_group_member() {
     let xml = r#"<Every xmlns="urn:t"><a foo="1">x</a></Every>"#;
     assert_eq!(errors(xml, false), Vec::<String>::new(), "lax: {xml}");
     assert!(!errors(xml, true).is_empty(), "strict accepted {xml}");
+}
+
+/// Five `a` fill the two rounds as 2 + 3 (or 3 + 2), each within the
+/// element's 2..4; three `a` fill only one round, nine exceed 2 x 4.
+/// xmllint: 5 validates, 3 and 9 fail.
+#[test]
+fn choice_rounds_split_like_xmllint() {
+    let split = |n: usize| format!(r#"<Split xmlns="urn:t">{}</Split>"#, "<a>x</a>".repeat(n));
+    assert_valid(&split(5));
+    assert_invalid(&split(3));
+    assert_invalid(&split(9));
 }
