@@ -3718,7 +3718,9 @@ fn validate_all(
             |p| matches!(p, XsdParticle::Element(d) if element_matches_decl(doc, child, d, schema)),
         );
         if let Some(XsdParticle::Element(decl)) = matching {
-            let count = seen.entry(child_name).or_insert(0);
+            // Count under the particle, not the instance name: a
+            // substitution-group member occupies its head's slot.
+            let count = seen.entry(decl.name.as_str()).or_insert(0);
             *count += 1;
             if let MaxOccurs::Bounded(max) = decl.max_occurs {
                 if *count > max {
