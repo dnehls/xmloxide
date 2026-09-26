@@ -357,8 +357,16 @@ pub struct ComplexType {
 pub enum ComplexContent {
     /// No child elements or text content allowed.
     Empty,
-    /// An ordered sequence of particles, all of which must appear in order.
-    Sequence(Vec<XsdParticle>),
+    /// An ordered sequence of particles, repeated as a whole
+    /// `min_occurs`..`max_occurs` times (XSD 1.0 §3.8).
+    Sequence {
+        /// The particles, in order.
+        particles: Vec<XsdParticle>,
+        /// Minimum number of rounds (default 1).
+        min_occurs: u32,
+        /// Maximum number of rounds (default 1).
+        max_occurs: MaxOccurs,
+    },
     /// A choice among particles; one alternative per round, repeated
     /// `min_occurs`..`max_occurs` times (XSD 1.0 §3.8).
     Choice {
@@ -1170,7 +1178,7 @@ impl GroupResolver {
 
     fn expand_content(&mut self, content: &mut ComplexContent) {
         let particles = match content {
-            ComplexContent::Sequence(p)
+            ComplexContent::Sequence { particles: p, .. }
             | ComplexContent::Choice { particles: p, .. }
             | ComplexContent::All(p) => p,
             ComplexContent::Empty | ComplexContent::SimpleContent { .. } => return,
@@ -1211,6 +1219,11 @@ fn with_ref_occurs(
         return group;
     }
     match group {
+        ComplexContent::Sequence { particles, .. } => ComplexContent::Sequence {
+            particles,
+            min_occurs,
+            max_occurs,
+        },
         ComplexContent::Choice { particles, .. } => ComplexContent::Choice {
             particles,
             min_occurs,
@@ -1269,7 +1282,7 @@ fn expand_attr_groups_in_content(
     groups: &HashMap<String, Vec<XsdAttribute>>,
 ) {
     let particles = match content {
-        ComplexContent::Sequence(p)
+        ComplexContent::Sequence { particles: p, .. }
         | ComplexContent::Choice { particles: p, .. }
         | ComplexContent::All(p) => p,
         ComplexContent::Empty | ComplexContent::SimpleContent { .. } => return,
@@ -1404,19 +1417,26 @@ fn merge_type_extension(
     if let Some(XsdType::Complex(ct)) = types.get_mut(type_name) {
         // Merge content model particles
         match &mut ct.content {
-            ComplexContent::Sequence(ext_particles) => {
+            ComplexContent::Sequence {
+                particles: ext_particles,
+                min_occurs: 1,
+                max_occurs: MaxOccurs::Bounded(1),
+            } => {
                 let mut merged = base_particles;
                 merged.append(ext_particles);
                 *ext_particles = merged;
             }
             ComplexContent::Empty => {
-                ct.content = ComplexContent::Sequence(base_particles);
+                ct.content = sequence_once(base_particles);
             }
-            ComplexContent::Choice { .. } | ComplexContent::All(_) => {
+            // A repeated sequence repeats without the base's particles.
+            ComplexContent::Sequence { .. }
+            | ComplexContent::Choice { .. }
+            | ComplexContent::All(_) => {
                 let mut merged = base_particles;
                 let existing = ct.content.clone();
                 merged.push(XsdParticle::Group(existing));
-                ct.content = ComplexContent::Sequence(merged);
+                ct.content = sequence_once(merged);
             }
             ComplexContent::SimpleContent { .. } => {}
         }
@@ -1547,9 +1567,13 @@ fn resolve_base_particles_impl(
 
     // Then append this type's own particles
     match &ct.content {
-        ComplexContent::Sequence(p) => particles.extend(p.iter().cloned()),
+        ComplexContent::Sequence {
+            particles: p,
+            min_occurs: 1,
+            max_occurs: MaxOccurs::Bounded(1),
+        } => particles.extend(p.iter().cloned()),
         ComplexContent::Empty | ComplexContent::SimpleContent { .. } => {}
-        ComplexContent::Choice { .. } => {
+        ComplexContent::Sequence { .. } | ComplexContent::Choice { .. } => {
             particles.push(XsdParticle::Group(ct.content.clone()));
         }
         ComplexContent::All(p) => {
@@ -2026,9 +2050,8 @@ fn parse_compositor(
     ctx: &DeclContext<'_>,
 ) -> ComplexContent {
     let mut particles = Vec::new();
-    // Read compositor-level minOccurs/maxOccurs.
-    // XSD 1.0: these apply to the group as a whole.
-    // When minOccurs=0, all direct element children become effectively optional.
+    // Compositor-level minOccurs/maxOccurs apply to the group as a whole
+    // (XSD 1.0 §3.8.2); sequence and choice keep them as rounds.
     let compositor_min = parse_min_occurs(doc, node);
     let compositor_max = doc
         .attribute(node, "maxOccurs")
@@ -2047,10 +2070,9 @@ fn parse_compositor(
         match child_name {
             "element" => {
                 if let Some(mut elem) = parse_element_decl(doc, child, ctx, false) {
-                    // If the compositor itself is optional (minOccurs=0),
-                    // propagate that to element children so the validator
-                    // doesn't require them.
-                    if compositor_min == 0 {
+                    // An `all` group has no rounds: an optional one makes
+                    // its members optional.
+                    if compositor_min == 0 && matches!(kind, CompositorKind::All) {
                         elem.min_occurs = 0;
                     }
                     particles.push(XsdParticle::Element(elem));
@@ -2098,22 +2120,12 @@ fn parse_compositor(
             _ => {}
         }
     }
-    // For single-element compositor groups, group maxOccurs can be safely
-    // propagated to the child element (A repeated N times == element A maxOccurs=N).
-    // A choice keeps its own occurrences instead; propagating them as well
-    // would count every repetition twice.
-    if particles.len() == 1 && !matches!(kind, CompositorKind::Choice) {
-        if let XsdParticle::Element(elem) = &mut particles[0] {
-            match compositor_max {
-                MaxOccurs::Bounded(n) if n > 1 => elem.max_occurs = MaxOccurs::Bounded(n),
-                MaxOccurs::Unbounded => elem.max_occurs = MaxOccurs::Unbounded,
-                MaxOccurs::Bounded(_) => {}
-            }
-        }
-    }
-
     match kind {
-        CompositorKind::Sequence => ComplexContent::Sequence(particles),
+        CompositorKind::Sequence => ComplexContent::Sequence {
+            particles,
+            min_occurs: compositor_min,
+            max_occurs: compositor_max,
+        },
         CompositorKind::Choice => ComplexContent::Choice {
             particles,
             min_occurs: compositor_min,
@@ -2131,6 +2143,15 @@ fn parse_min_occurs(doc: &Document, node: NodeId) -> u32 {
     doc.attribute(node, "minOccurs")
         .and_then(|v| v.parse().ok())
         .unwrap_or(1)
+}
+
+/// A sequence of `particles` that occurs exactly once.
+fn sequence_once(particles: Vec<XsdParticle>) -> ComplexContent {
+    ComplexContent::Sequence {
+        particles,
+        min_occurs: 1,
+        max_occurs: MaxOccurs::Bounded(1),
+    }
 }
 
 /// Parses the `maxOccurs` attribute from a particle node (default 1).
@@ -2450,7 +2471,7 @@ pub fn get_type_element_order(type_name: &str, schema: &XsdSchema) -> Option<Vec
 
 fn extract_element_names(content: &ComplexContent) -> Option<Vec<String>> {
     match content {
-        ComplexContent::Sequence(particles) => {
+        ComplexContent::Sequence { particles, .. } => {
             let mut names = Vec::new();
             for p in particles {
                 match p {
@@ -2728,12 +2749,20 @@ fn validate_complex_element_strict(
                 errors,
             );
         }
-        ComplexContent::Sequence(p) => {
+        ComplexContent::Sequence {
+            particles,
+            min_occurs,
+            max_occurs,
+        } => {
             let ce = collect_child_elements(doc, node);
-            let _ = validate_sequence_strict(
+            validate_sequence_content(
                 doc,
                 &ce,
-                p,
+                &SequenceGroup {
+                    particles,
+                    min_occurs: *min_occurs,
+                    max_occurs: max_occurs.clone(),
+                },
                 doc.node_name(node).unwrap_or("<unknown>"),
                 schema,
                 errors,
@@ -2918,9 +2947,23 @@ fn validate_group_content_strict(
     errors: &mut Vec<ValidationError>,
 ) -> usize {
     match content {
-        ComplexContent::Sequence(particles) => {
-            validate_sequence_strict(doc, children, particles, parent_name, schema, errors, false)
-        }
+        ComplexContent::Sequence {
+            particles,
+            min_occurs,
+            max_occurs,
+        } => validate_sequence_rounds(
+            doc,
+            children,
+            &SequenceGroup {
+                particles,
+                min_occurs: *min_occurs,
+                max_occurs: max_occurs.clone(),
+            },
+            parent_name,
+            schema,
+            errors,
+            true,
+        ),
         ComplexContent::Choice {
             particles,
             min_occurs,
@@ -3086,9 +3129,25 @@ fn validate_complex_element(
     validate_attributes(doc, node, &ct.attributes, schema, errors);
     match &ct.content {
         ComplexContent::Empty => validate_empty_content(doc, node, elem_name, ct.mixed, errors),
-        ComplexContent::Sequence(p) => {
+        ComplexContent::Sequence {
+            particles,
+            min_occurs,
+            max_occurs,
+        } => {
             let ce = collect_child_elements(doc, node);
-            validate_sequence(doc, &ce, p, elem_name, schema, errors, true);
+            validate_sequence_content(
+                doc,
+                &ce,
+                &SequenceGroup {
+                    particles,
+                    min_occurs: *min_occurs,
+                    max_occurs: max_occurs.clone(),
+                },
+                elem_name,
+                schema,
+                errors,
+                false,
+            );
         }
         ComplexContent::Choice {
             particles,
@@ -3370,7 +3429,7 @@ fn matches_later_group(
 ) -> bool {
     match content {
         ComplexContent::Empty | ComplexContent::SimpleContent { .. } => false,
-        ComplexContent::Sequence(particles) | ComplexContent::All(particles) => {
+        ComplexContent::Sequence { particles, .. } | ComplexContent::All(particles) => {
             matches_later_particle(doc, child, particles, schema)
         }
         ComplexContent::Choice { particles, .. } => {
@@ -3549,9 +3608,23 @@ fn validate_group_content(
     errors: &mut Vec<ValidationError>,
 ) -> usize {
     match content {
-        ComplexContent::Sequence(particles) => {
-            validate_sequence(doc, children, particles, parent_name, schema, errors, false)
-        }
+        ComplexContent::Sequence {
+            particles,
+            min_occurs,
+            max_occurs,
+        } => validate_sequence_rounds(
+            doc,
+            children,
+            &SequenceGroup {
+                particles,
+                min_occurs: *min_occurs,
+                max_occurs: max_occurs.clone(),
+            },
+            parent_name,
+            schema,
+            errors,
+            false,
+        ),
         ComplexContent::Choice {
             particles,
             min_occurs,
@@ -3712,6 +3785,165 @@ fn validate_children_laxly(
     }
 }
 
+/// A sequence group with its occurrences, borrowed from
+/// [`ComplexContent::Sequence`].
+struct SequenceGroup<'a> {
+    particles: &'a [XsdParticle],
+    min_occurs: u32,
+    max_occurs: MaxOccurs,
+}
+
+/// Validates the sequence content model of an element: all of `children`
+/// must be consumed. `strict` selects the strict API's rules.
+#[allow(clippy::too_many_arguments)]
+fn validate_sequence_content(
+    doc: &Document,
+    children: &[NodeId],
+    seq: &SequenceGroup<'_>,
+    parent_name: &str,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+    strict: bool,
+) {
+    if seq.min_occurs == 1 && seq.max_occurs == MaxOccurs::Bounded(1) {
+        if strict {
+            validate_sequence_strict(
+                doc,
+                children,
+                seq.particles,
+                parent_name,
+                schema,
+                errors,
+                true,
+            );
+        } else {
+            validate_sequence(
+                doc,
+                children,
+                seq.particles,
+                parent_name,
+                schema,
+                errors,
+                true,
+            );
+        }
+        return;
+    }
+    let consumed =
+        validate_sequence_rounds(doc, children, seq, parent_name, schema, errors, strict);
+    for &child in &children[consumed..] {
+        let name = doc.node_name(child).unwrap_or("<unknown>");
+        errors.push(ValidationError {
+            message: format!(
+                "unexpected element <{name}> in <{parent_name}>; not expected by the content model"
+            ),
+            line: None,
+            column: None,
+        });
+    }
+}
+
+/// Validates a sequence group repeated `min_occurs`..`max_occurs` times,
+/// returning the children consumed.
+///
+/// Each round validates the whole sequence against the remaining children.
+/// A round beyond `min_occurs` starts only when the next child can begin
+/// the sequence, and a round that consumes nothing ends the repetition.
+/// Fewer than `min_occurs` rounds is an error unless the sequence can be
+/// empty; the errors of the failed round say what is missing.
+#[allow(clippy::too_many_arguments)]
+fn validate_sequence_rounds(
+    doc: &Document,
+    children: &[NodeId],
+    seq: &SequenceGroup<'_>,
+    parent_name: &str,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+    strict: bool,
+) -> usize {
+    let mut idx = 0;
+    let mut rounds: u32 = 0;
+    let mut failed_round = Vec::new();
+    loop {
+        if let MaxOccurs::Bounded(max) = seq.max_occurs {
+            if rounds >= max {
+                break;
+            }
+        }
+        if rounds >= seq.min_occurs
+            && !children
+                .get(idx)
+                .is_some_and(|&c| sequence_starts_with(doc, c, seq.particles, schema))
+        {
+            break;
+        }
+        let mut round_errors = Vec::new();
+        let rest = &children[idx..];
+        let consumed = if strict {
+            validate_sequence_strict(
+                doc,
+                rest,
+                seq.particles,
+                parent_name,
+                schema,
+                &mut round_errors,
+                false,
+            )
+        } else {
+            validate_sequence(
+                doc,
+                rest,
+                seq.particles,
+                parent_name,
+                schema,
+                &mut round_errors,
+                false,
+            )
+        };
+        if consumed == 0 {
+            failed_round = round_errors;
+            break;
+        }
+        errors.append(&mut round_errors);
+        idx += consumed;
+        rounds += 1;
+    }
+    if rounds < seq.min_occurs && !seq.particles.iter().all(particle_emptiable) {
+        if failed_round.is_empty() {
+            errors.push(ValidationError {
+                message: format!(
+                    "element <{parent_name}> requires at least {} occurrence(s) of the sequence, found {rounds}",
+                    seq.min_occurs
+                ),
+                line: None,
+                column: None,
+            });
+        } else {
+            errors.append(&mut failed_round);
+        }
+    }
+    idx
+}
+
+/// Whether `child` can be the first child a sequence of `particles`
+/// consumes: it starts a particle that only emptiable particles precede.
+fn sequence_starts_with(
+    doc: &Document,
+    child: NodeId,
+    particles: &[XsdParticle],
+    schema: &XsdSchema,
+) -> bool {
+    for particle in particles {
+        if choice_particle_matches(doc, child, particle, schema) {
+            return true;
+        }
+        if !particle_emptiable(particle) {
+            return false;
+        }
+    }
+    false
+}
+
 /// A choice group with its occurrences, borrowed from
 /// [`ComplexContent::Choice`].
 struct ChoiceGroup<'a> {
@@ -3864,7 +4096,12 @@ fn particle_emptiable(particle: &XsdParticle) -> bool {
 fn content_emptiable(content: &ComplexContent) -> bool {
     match content {
         ComplexContent::Empty | ComplexContent::SimpleContent { .. } => true,
-        ComplexContent::Sequence(p) | ComplexContent::All(p) => p.iter().all(particle_emptiable),
+        ComplexContent::Sequence {
+            particles,
+            min_occurs,
+            ..
+        } => *min_occurs == 0 || particles.iter().all(particle_emptiable),
+        ComplexContent::All(p) => p.iter().all(particle_emptiable),
         ComplexContent::Choice {
             particles,
             min_occurs,
@@ -4767,7 +5004,7 @@ mod tests {
         );
         let elem = &schema.elements["person"];
         if let Some(XsdType::Complex(ct)) = &elem.inline_type {
-            if let ComplexContent::Sequence(p) = &ct.content {
+            if let ComplexContent::Sequence { particles: p, .. } = &ct.content {
                 assert_eq!(p.len(), 2);
             } else {
                 panic!("expected sequence");
@@ -4844,7 +5081,7 @@ mod tests {
         </xs:schema>"#,
         );
         if let Some(XsdType::Complex(ct)) = &schema.elements["order"].inline_type {
-            if let ComplexContent::Sequence(p) = &ct.content {
+            if let ComplexContent::Sequence { particles: p, .. } = &ct.content {
                 if let XsdParticle::Element(item) = &p[0] {
                     assert_eq!(item.name, "item");
                     assert!(item.inline_type.is_some());
@@ -7033,7 +7270,7 @@ fn test_nas_substitution_group_resolution() {
     if let Some(XsdType::Complex(ct)) = schema.types.get("FeatureCollectionType") {
         eprintln!("\nFeatureCollectionType content:");
         match &ct.content {
-            ComplexContent::Sequence(particles) => {
+            ComplexContent::Sequence { particles, .. } => {
                 for p in particles {
                     match p {
                         XsdParticle::Element(e) => {
@@ -7052,7 +7289,7 @@ fn test_nas_substitution_group_resolution() {
         if let Some(XsdType::Complex(ct)) = imp.types.get("FeatureCollectionType") {
             eprintln!("\nIMPORTED FeatureCollectionType [{ns}] content:");
             match &ct.content {
-                ComplexContent::Sequence(particles) => {
+                ComplexContent::Sequence { particles, .. } => {
                     for p in particles {
                         match p {
                             XsdParticle::Element(e) => {
