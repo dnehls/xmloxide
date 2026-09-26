@@ -3350,7 +3350,8 @@ fn validate_choice(
         match p {
             XsdParticle::Element(decl) => {
                 if element_matches_decl(doc, first, decl, schema) {
-                    validate_element(doc, first, decl, schema, errors);
+                    let effective = effective_decl(doc, first, decl, schema);
+                    validate_element(doc, first, effective, schema, errors);
                     return true;
                 }
                 false
