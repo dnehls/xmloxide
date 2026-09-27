@@ -4436,7 +4436,10 @@ fn validate_union_value(
     }
 }
 
-/// Validates a value against a built-in XSD type.
+/// Validates a value against a built-in XSD type, after normalizing it by
+/// the builtin's whiteSpace (XSD Part 2, 4.3.6). Normalizing a value that
+/// is already normalized for a derived type changes nothing, since a
+/// derivation can only tighten whiteSpace.
 #[allow(clippy::too_many_lines)]
 fn validate_builtin_value(
     value: &str,
@@ -4444,6 +4447,8 @@ fn validate_builtin_value(
     context: &str,
     errors: &mut Vec<ValidationError>,
 ) {
+    let value = apply_whitespace_normalization(value, &builtin_whitespace(type_name));
+    let value = value.as_str();
     match type_name {
         "integer" | "long" | "int" | "short" | "byte" => {
             validate_signed_integer(value, type_name, context, errors);

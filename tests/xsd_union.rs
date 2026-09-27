@@ -80,3 +80,15 @@ fn nil_reason_enumeration_shape() {
     assert_invalid(types, "NilReasonEnumeration", "other:x");
     assert_invalid(types, "NilReasonEnumeration", "bogus");
 }
+
+/// Every builtin but `string` and `normalizedString` has whiteSpace
+/// `collapse` (REC-xmlschema-2-20041028 4.3.6), also as a union member.
+#[test]
+fn builtin_int_collapses_whitespace() {
+    let types = r#"<xs:simpleType name="U"><xs:union memberTypes="xs:int"/></xs:simpleType>"#;
+    assert_valid(types, "xs:int", " 5");
+    assert_valid(types, "xs:int", "5\n");
+    assert_invalid(types, "xs:int", "5 5");
+    assert_valid(types, "U", " 5");
+    assert_invalid(types, "U", " x");
+}
