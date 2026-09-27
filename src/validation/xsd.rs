@@ -50,6 +50,7 @@ use crate::validation::{ValidationError, ValidationResult};
 
 /// The XML Schema namespace URI.
 const XSD_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema";
+const XSI_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
 // ---------------------------------------------------------------------------
 // Schema resolver
@@ -199,6 +200,11 @@ pub struct XsdElement {
     /// Abstract elements cannot appear directly in instance documents;
     /// only their substitution group members can.
     pub is_abstract: bool,
+    /// Whether this element is nillable (`nillable="true"`).
+    ///
+    /// See XSD 1.0 section 3.3.2 {nillable}: an instance element may then
+    /// carry `xsi:nil="true"` and have no content.
+    pub nillable: bool,
 }
 
 /// Maximum occurrence constraint for particles.
@@ -1726,6 +1732,7 @@ fn parse_element_decl(
             max_occurs,
             substitution_group: None,
             is_abstract: false,
+            nillable: false,
         });
     }
 
@@ -1746,6 +1753,9 @@ fn parse_element_decl(
     let is_abstract = doc
         .attribute(node, "abstract")
         .is_some_and(|v| v == "true" || v == "1");
+    let nillable = doc
+        .attribute(node, "nillable")
+        .is_some_and(|v| v == "true" || v == "1");
     Some(XsdElement {
         name,
         type_ref,
@@ -1756,6 +1766,7 @@ fn parse_element_decl(
         max_occurs,
         substitution_group,
         is_abstract,
+        nillable,
     })
 }
 
@@ -2619,10 +2630,18 @@ pub fn validate_element_strict(
                 declared_attrs = inherited;
             }
             validate_attributes_strict(doc, node, &declared_attrs, schema, errors);
-            validate_complex_element_strict(doc, node, ct, schema, errors);
+            if is_nilled(doc, node, decl, schema) {
+                validate_nilled_content(doc, node, errors);
+            } else {
+                validate_complex_element_strict(doc, node, ct, schema, errors);
+            }
         }
         Some(XsdType::Simple(st)) => {
-            validate_simple_element(doc, node, st, schema, errors);
+            if is_nilled(doc, node, decl, schema) {
+                validate_nilled_content(doc, node, errors);
+            } else {
+                validate_simple_element(doc, node, st, schema, errors);
+            }
             validate_attributes_strict(doc, node, &[], schema, errors);
         }
         None => {
@@ -2640,6 +2659,43 @@ pub fn validate_element_strict(
             // Content of an element without a usable type is assessed laxly.
             validate_children_laxly(doc, node, schema, errors, true);
         }
+    }
+}
+
+/// Returns `true` when `node` carries `xsi:nil="true"` and `decl` (or the
+/// global declaration it references) is nillable (XSD 1.0 §3.3.4, Element
+/// Locally Valid (Element) clause 3.2). Such an element has no content to
+/// match against its type.
+fn is_nilled(doc: &Document, node: NodeId, decl: &XsdElement, schema: &XsdSchema) -> bool {
+    let nillable = if decl.element_ref.is_some() {
+        resolve_ref_target(decl, schema).is_some_and(|target| target.nillable)
+    } else {
+        decl.nillable
+    };
+    nillable
+        && doc.attributes(node).iter().any(|attr| {
+            attr.name == "nil"
+                && attr.namespace.as_deref() == Some(XSI_NAMESPACE)
+                && matches!(attr.value.trim(), "true" | "1")
+        })
+}
+
+/// A nilled element must have neither character nor element children
+/// (XSD 1.0 §3.3.4, Element Locally Valid (Element) clause 3.2.1).
+fn validate_nilled_content(doc: &Document, node: NodeId, errors: &mut Vec<ValidationError>) {
+    let has_content = doc.children(node).any(|c| {
+        matches!(
+            doc.node(c).kind,
+            NodeKind::Element { .. } | NodeKind::Text { .. } | NodeKind::CData { .. }
+        )
+    });
+    if has_content {
+        let elem_name = doc.node_name(node).unwrap_or("<unknown>");
+        errors.push(ValidationError {
+            message: format!("element <{elem_name}> is nil but has content"),
+            line: None,
+            column: None,
+        });
     }
 }
 
@@ -3033,6 +3089,13 @@ fn validate_element(
     errors: &mut Vec<ValidationError>,
 ) {
     match resolve_element_type(decl, schema) {
+        Some(XsdType::Complex(ct)) if is_nilled(doc, node, decl, schema) => {
+            validate_attributes(doc, node, &ct.attributes, schema, errors);
+            validate_nilled_content(doc, node, errors);
+        }
+        Some(XsdType::Simple(_)) if is_nilled(doc, node, decl, schema) => {
+            validate_nilled_content(doc, node, errors);
+        }
         Some(XsdType::Complex(ct)) => validate_complex_element(doc, node, ct, schema, errors),
         Some(XsdType::Simple(st)) => validate_simple_element(doc, node, st, schema, errors),
         // anyType (or a type unknown to the schema): assess content laxly.
