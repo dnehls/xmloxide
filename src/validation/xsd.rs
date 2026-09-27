@@ -2633,12 +2633,7 @@ pub fn validate_element_strict(
 ) {
     match resolve_element_type(decl, schema) {
         Some(XsdType::Complex(ct)) => {
-            let mut declared_attrs = ct.attributes.clone();
-            if let ComplexContent::SimpleContent { base } = &ct.content {
-                let mut inherited = resolve_simple_content_base_attributes(base, schema);
-                inherited.append(&mut declared_attrs);
-                declared_attrs = inherited;
-            }
+            let declared_attrs = effective_attributes(ct, schema);
             validate_attributes_strict(doc, node, &declared_attrs, schema, errors);
             if is_nilled(doc, node, decl, schema) {
                 validate_nilled_content(doc, node, errors);
@@ -2718,6 +2713,19 @@ fn declares_any_type(decl: &XsdElement, schema: &XsdSchema) -> bool {
             .is_some_and(|target| target.type_ref.is_none() && target.inline_type.is_none());
     }
     decl.type_ref.is_none() && decl.inline_type.is_none()
+}
+
+/// Attribute uses of `ct`: those inherited from a simpleContent base type
+/// followed by its own. complexContent derivation is merged at load time.
+fn effective_attributes(ct: &ComplexType, schema: &XsdSchema) -> Vec<XsdAttribute> {
+    let mut attrs = match &ct.content {
+        ComplexContent::SimpleContent { base } => {
+            resolve_simple_content_base_attributes(base, schema)
+        }
+        _ => Vec::new(),
+    };
+    attrs.extend(ct.attributes.iter().cloned());
+    attrs
 }
 
 fn resolve_simple_content_base_attributes(
@@ -3100,7 +3108,7 @@ fn validate_element(
 ) {
     match resolve_element_type(decl, schema) {
         Some(XsdType::Complex(ct)) if is_nilled(doc, node, decl, schema) => {
-            validate_attributes(doc, node, &ct.attributes, schema, errors);
+            validate_attributes(doc, node, &effective_attributes(ct, schema), schema, errors);
             validate_nilled_content(doc, node, errors);
         }
         Some(XsdType::Simple(_)) if is_nilled(doc, node, decl, schema) => {
@@ -3218,7 +3226,7 @@ fn validate_complex_element(
     errors: &mut Vec<ValidationError>,
 ) {
     let elem_name = doc.node_name(node).unwrap_or("<unknown>");
-    validate_attributes(doc, node, &ct.attributes, schema, errors);
+    validate_attributes(doc, node, &effective_attributes(ct, schema), schema, errors);
     match &ct.content {
         ComplexContent::Empty => validate_empty_content(doc, node, elem_name, ct.mixed, errors),
         ComplexContent::Sequence {
