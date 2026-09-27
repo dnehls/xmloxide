@@ -38,6 +38,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 encoding_rs = "0.8"
 libxml = { version = "0.3", optional = true }
 quick-xml = { version = "0.37", optional = true }
+regex = { version = "1", default-features = false, features = ["std", "unicode"] }
 roxmltree = { version = "0.20", optional = true }
 serde = { version = "1", optional = true }
 tokio = { version = "1", features = ["io-util"], optional = true }

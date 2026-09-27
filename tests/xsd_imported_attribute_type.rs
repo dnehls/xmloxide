@@ -1,9 +1,9 @@
 //! Attribute types named by a prefixed `QName` resolve like element types:
 //! through the root prefix map, the target namespace and the imported
 //! namespaces. An unresolved name used to fall through to the built-in
-//! check, which accepts every unknown type name. Pattern facets the matcher
-//! cannot evaluate (groups, alternation, counted quantifiers) count as not
-//! checkable instead of violated; xmllint (libxml2) is the reference.
+//! check, which accepts every unknown type name. The `UomIdentifier` patterns
+//! with groups and alternation are evaluated; xmllint (libxml2) is the
+//! reference.
 use xmloxide::validation::xsd::{
     parse_xsd_with_options, validate_xsd, validate_xsd_strict, XsdParseOptions,
 };
@@ -92,7 +92,7 @@ fn union_member_from_imported_namespace_is_validated() {
 }
 
 #[test]
-fn unsupported_pattern_is_not_a_violation() {
+fn grouped_pattern_accepts_matching_values() {
     for strict in [false, true] {
         for uom in ["urn:adv:uom:rad", "m", "#deg"] {
             assert_eq!(

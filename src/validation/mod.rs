@@ -18,6 +18,7 @@ pub mod dtd;
 pub mod relaxng;
 pub mod schematron;
 pub mod xsd;
+mod xsd_regex;
 
 use std::fmt;
 
