@@ -4418,7 +4418,7 @@ fn validate_simple_value(
                 apply_whitespace_normalization(passed, &builtin_whitespace(base))
             };
             let value = own.unwrap_or(from_base);
-            validate_facets(&value, facets, context, errors);
+            validate_facets(&value, facets, length_unit(st, schema), context, errors);
             value
         }
         SimpleTypeVariety::List {
@@ -4818,6 +4818,65 @@ fn effective_whitespace(st: &SimpleType, schema: &XsdSchema) -> Option<WhiteSpac
     Some(WhiteSpaceValue::Collapse)
 }
 
+/// What the length facets of a type count (XSD Part 2, 4.3.1.3).
+#[derive(Clone, Copy)]
+enum LengthUnit {
+    Chars,
+    Items,
+    HexOctets,
+    Base64Octets,
+    /// `QName` and `NOTATION`: length facets have no effect (as in xmllint).
+    Ignored,
+}
+
+/// The length unit of a restriction: items below a list, the decoded
+/// octets of `hexBinary` and `base64Binary`, else characters.
+fn length_unit(st: &SimpleType, schema: &XsdSchema) -> LengthUnit {
+    let mut current = st;
+    // A derivation chain longer than this is a cycle.
+    for _ in 0..64 {
+        match &current.variety {
+            SimpleTypeVariety::Builtin(name) => return builtin_length_unit(name),
+            SimpleTypeVariety::Restriction {
+                base, inline_base, ..
+            } => match inline_base.as_deref().or_else(|| {
+                resolve_simple_type(base, schema).filter(|bt| !std::ptr::eq(*bt, current))
+            }) {
+                Some(bt) => current = bt,
+                None => return builtin_length_unit(base),
+            },
+            SimpleTypeVariety::List { .. } => return LengthUnit::Items,
+            SimpleTypeVariety::Union { .. } => break,
+        }
+    }
+    LengthUnit::Chars
+}
+
+fn builtin_length_unit(name: &str) -> LengthUnit {
+    match name.rsplit(':').next().unwrap_or(name) {
+        "hexBinary" => LengthUnit::HexOctets,
+        "base64Binary" => LengthUnit::Base64Octets,
+        "NMTOKENS" | "IDREFS" | "ENTITIES" => LengthUnit::Items,
+        "QName" | "NOTATION" => LengthUnit::Ignored,
+        _ => LengthUnit::Chars,
+    }
+}
+
+/// The length of a normalized value in `unit`, `None` if not measured.
+fn value_length(value: &str, unit: LengthUnit) -> Option<usize> {
+    match unit {
+        LengthUnit::Chars => Some(value.chars().count()),
+        LengthUnit::Items => Some(value.split_whitespace().count()),
+        LengthUnit::HexOctets => Some(value.chars().count() / 2),
+        LengthUnit::Base64Octets => {
+            let chars = value.chars().filter(|c| !c.is_whitespace()).count();
+            let pad = value.chars().filter(|&c| c == '=').count();
+            Some((chars * 3 / 4).saturating_sub(pad))
+        }
+        LengthUnit::Ignored => None,
+    }
+}
+
 /// The whiteSpace value of a builtin type (XSD Part 2, 4.3.6).
 fn builtin_whitespace(name: &str) -> WhiteSpaceValue {
     match name {
@@ -4832,11 +4891,13 @@ fn builtin_whitespace(name: &str) -> WhiteSpaceValue {
 fn validate_facets(
     value: &str,
     facets: &[Facet],
+    unit: LengthUnit,
     context: &str,
     errors: &mut Vec<ValidationError>,
 ) {
+    let length = value_length(value, unit);
     for facet in facets {
-        validate_single_facet(value, facet, context, errors);
+        validate_single_facet(value, length, facet, context, errors);
     }
 
     // The patterns of one restriction step combine as branches of a single
@@ -4861,45 +4922,40 @@ fn validate_facets(
     }
 }
 
-/// Validates a single facet constraint.
+/// Validates a single facet constraint. `length` is the value's length
+/// in the unit of its type, `None` where length facets do not apply.
 #[allow(clippy::too_many_lines)]
 fn validate_single_facet(
     value: &str,
+    length: Option<usize>,
     facet: &Facet,
     context: &str,
     errors: &mut Vec<ValidationError>,
 ) {
     match facet {
         Facet::MinLength(min) => {
-            if value.len() < *min {
+            if let Some(n) = length.filter(|n| n < min) {
                 errors.push(ValidationError {
-                    message: format!(
-                        "value in <{context}> has length {} but minLength is {min}",
-                        value.len()
-                    ),
+                    message: format!("value in <{context}> has length {n} but minLength is {min}"),
                     line: None,
                     column: None,
                 });
             }
         }
         Facet::MaxLength(max) => {
-            if value.len() > *max {
+            if let Some(n) = length.filter(|n| n > max) {
                 errors.push(ValidationError {
-                    message: format!(
-                        "value in <{context}> has length {} but maxLength is {max}",
-                        value.len()
-                    ),
+                    message: format!("value in <{context}> has length {n} but maxLength is {max}"),
                     line: None,
                     column: None,
                 });
             }
         }
         Facet::Length(len) => {
-            if value.len() != *len {
+            if let Some(n) = length.filter(|n| n != len) {
                 errors.push(ValidationError {
                     message: format!(
-                        "value in <{context}> has length {} but required length is {len}",
-                        value.len()
+                        "value in <{context}> has length {n} but required length is {len}"
                     ),
                     line: None,
                     column: None,
