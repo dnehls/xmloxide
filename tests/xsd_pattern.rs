@@ -129,3 +129,23 @@ fn mime_pattern_long_value_terminates() {
     let value = format!("text/xml{}", ";a=a".repeat(20_000));
     assert_valid(&t, "T", &value);
 }
+
+/// Several pattern facets in one restriction step are alternatives
+/// (XSD Part 2, 4.3.4.3); patterns of different derivation steps all apply.
+#[test]
+fn patterns_in_one_step_are_ored() {
+    let t = r#"<xs:simpleType name="T">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="a+"/><xs:pattern value="b+"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="U">
+    <xs:restriction base="T"><xs:pattern value="a*"/></xs:restriction>
+  </xs:simpleType>"#;
+    for ok in ["aa", "bb"] {
+        assert_valid(t, "T", ok);
+    }
+    assert_invalid(t, "T", "ab");
+    assert_valid(t, "U", "aa");
+    assert_invalid(t, "U", "bb");
+}

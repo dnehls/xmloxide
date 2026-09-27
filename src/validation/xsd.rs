@@ -4665,6 +4665,31 @@ fn validate_facets(
     for facet in facets {
         validate_single_facet(effective_value, facet, context, errors);
     }
+
+    // The patterns of one restriction step combine as branches of a single
+    // expression (XSD Part 2, 4.3.4.3): ORed here, while each derivation
+    // step is checked on its own and so ANDed.
+    let patterns: Vec<&str> = facets
+        .iter()
+        .filter_map(|f| match f {
+            Facet::Pattern(p) => Some(p.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !patterns.is_empty()
+        && !patterns
+            .iter()
+            .any(|p| matches_xsd_pattern(effective_value, p))
+    {
+        let pattern = patterns.join("|");
+        errors.push(ValidationError {
+            message: format!(
+                "value \"{effective_value}\" in <{context}> does not match pattern \"{pattern}\""
+            ),
+            line: None,
+            column: None,
+        });
+    }
 }
 
 /// Validates a single facet constraint.
@@ -4706,17 +4731,6 @@ fn validate_single_facet(
                     message: format!(
                         "value in <{context}> has length {} but required length is {len}",
                         value.len()
-                    ),
-                    line: None,
-                    column: None,
-                });
-            }
-        }
-        Facet::Pattern(pattern) => {
-            if !matches_xsd_pattern(value, pattern) {
-                errors.push(ValidationError {
-                    message: format!(
-                        "value \"{value}\" in <{context}> does not match pattern \"{pattern}\""
                     ),
                     line: None,
                     column: None,
@@ -4802,7 +4816,9 @@ fn validate_single_facet(
                 });
             }
         }
-        Facet::WhiteSpace(_) => {}
+        // WhiteSpace normalizes the value; patterns are alternatives of
+        // one step and are checked together in `validate_facets`.
+        Facet::WhiteSpace(_) | Facet::Pattern(_) => {}
     }
 }
 
