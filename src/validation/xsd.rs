@@ -2829,15 +2829,22 @@ fn validate_sequence_strict(
 ) -> usize {
     let mut idx = 0;
     let mut pidx = 0;
+    // The particle a missing-content error was already reported for.
+    let mut reported_at = None;
 
     while idx < children.len() && pidx < particles.len() {
         match &particles[pidx] {
             XsdParticle::Element(decl) => {
                 if element_matches_decl(doc, children[idx], decl, schema) {
-                    let effective = effective_decl(doc, children[idx], decl, schema);
-                    validate_element_strict(doc, children[idx], effective, schema, errors);
-                    idx += 1;
-                    handle_repeat_occurrences_strict(doc, children, &mut idx, decl, schema, errors);
+                    idx += validate_sequence_element(
+                        doc,
+                        &children[idx..],
+                        decl,
+                        parent_name,
+                        schema,
+                        errors,
+                        true,
+                    );
                     pidx += 1;
                 } else {
                     let child = children[idx];
@@ -2845,16 +2852,7 @@ fn validate_sequence_strict(
                         find_later_match(doc, child, &particles[pidx + 1..], schema)
                     {
                         let target_pidx = pidx + 1 + later_offset;
-                        let mut can_skip = true;
-                        for sp in pidx..target_pidx {
-                            if let XsdParticle::Element(sd) = &particles[sp] {
-                                if sd.min_occurs > 0 {
-                                    can_skip = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if can_skip {
+                        if particles[pidx..target_pidx].iter().all(particle_emptiable) {
                             pidx = target_pidx;
                         } else {
                             let child_name = doc.node_name(child).unwrap_or("<unknown>");
@@ -2868,10 +2866,12 @@ fn validate_sequence_strict(
                                 line: None,
                                 column: None,
                             });
+                            reported_at = Some(pidx);
                             idx += 1;
                         }
                     } else if report_unexpected {
                         if decl.min_occurs > 0 {
+                            reported_at = Some(pidx);
                             errors.push(ValidationError {
                                 message: format!(
                                     "element <{}> requires at least {} occurrence(s) of <{}>, found 0",
@@ -2921,6 +2921,25 @@ fn validate_sequence_strict(
                 idx += consumed;
                 pidx += 1;
             }
+        }
+    }
+
+    // Children ran out (or stopped matching) before the sequence was
+    // complete: the first particle left that cannot be empty is missing.
+    if reported_at != Some(pidx) {
+        if let Some(missing) = particles[pidx..].iter().find(|p| !particle_emptiable(p)) {
+            let what = match missing {
+                XsdParticle::Element(d) => {
+                    format!("<{}>", d.element_ref.as_deref().unwrap_or(&d.name))
+                }
+                XsdParticle::Group(_) => "group".to_string(),
+                XsdParticle::Any(_) => "wildcard element".to_string(),
+            };
+            errors.push(ValidationError {
+                message: format!("element <{parent_name}> is missing required {what}"),
+                line: None,
+                column: None,
+            });
         }
     }
 
@@ -3300,33 +3319,6 @@ fn validate_sequence(
         });
     }
     idx
-}
-
-/// Consumes additional occurrences of a sequence element when maxOccurs > 1.
-fn handle_repeat_occurrences_strict(
-    doc: &Document,
-    children: &[NodeId],
-    idx: &mut usize,
-    decl: &XsdElement,
-    schema: &XsdSchema,
-    errors: &mut Vec<ValidationError>,
-) {
-    if let MaxOccurs::Bounded(max) = decl.max_occurs {
-        for _ in 1..max {
-            if *idx >= children.len() || !element_matches_decl(doc, children[*idx], decl, schema) {
-                break;
-            }
-            let effective = effective_decl(doc, children[*idx], decl, schema);
-            validate_element_strict(doc, children[*idx], effective, schema, errors);
-            *idx += 1;
-        }
-    } else {
-        while *idx < children.len() && element_matches_decl(doc, children[*idx], decl, schema) {
-            let effective = effective_decl(doc, children[*idx], decl, schema);
-            validate_element_strict(doc, children[*idx], effective, schema, errors);
-            *idx += 1;
-        }
-    }
 }
 
 /// Returns the index of the first particle in `later_particles` that matches
