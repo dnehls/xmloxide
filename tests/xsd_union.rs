@@ -92,3 +92,21 @@ fn builtin_int_collapses_whitespace() {
     assert_valid(types, "U", " 5");
     assert_invalid(types, "U", " x");
 }
+
+/// A restriction of a union has no whiteSpace of its own: the member that
+/// accepts the raw value normalizes it, and the facets of the restriction
+/// see that member's value (REC-xmlschema-2-20041028 2.5.1.3, 4.3.6).
+#[test]
+fn union_restriction_normalizes_per_member() {
+    let types = r#"<xs:simpleType name="S"><xs:restriction base="xs:string"><xs:pattern value="[a-z]+"/></xs:restriction></xs:simpleType>
+  <xs:simpleType name="Un"><xs:union memberTypes="S"/></xs:simpleType>
+  <xs:simpleType name="T"><xs:restriction base="Un"><xs:pattern value="a+"/></xs:restriction></xs:simpleType>
+  <xs:simpleType name="T2"><xs:restriction base="T"/></xs:simpleType>
+  <xs:simpleType name="Ui"><xs:union memberTypes="xs:int"/></xs:simpleType>
+  <xs:simpleType name="Ti"><xs:restriction base="Ui"><xs:pattern value="[0-9]+"/></xs:restriction></xs:simpleType>"#;
+    assert_valid(types, "T", "aa");
+    assert_invalid(types, "T", " aa");
+    assert_invalid(types, "T2", " aa");
+    assert_valid(types, "Ti", " 5");
+    assert_invalid(types, "Ti", " -5");
+}

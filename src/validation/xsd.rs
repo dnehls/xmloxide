@@ -4353,25 +4353,37 @@ fn validate_simple_element(
     validate_simple_value(&doc.text_content(node), st, elem_name, schema, errors);
 }
 
-/// Validates a string value against a simple type definition.
+/// Validates a string value against a simple type definition and returns
+/// the value as normalized by the type's whiteSpace.
 fn validate_simple_value(
     value: &str,
     st: &SimpleType,
     context: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
-) {
+) -> String {
     match &st.variety {
-        SimpleTypeVariety::Builtin(name) => validate_builtin_value(value, name, context, errors),
+        SimpleTypeVariety::Builtin(name) => {
+            validate_builtin_value(value, name, context, errors);
+            apply_whitespace_normalization(value, &builtin_whitespace(name))
+        }
         SimpleTypeVariety::Restriction { base, facets } => {
-            let value = &apply_whitespace_normalization(value, &effective_whitespace(st, schema));
-            if let Some(bt) = resolve_simple_type(base, schema).filter(|bt| !std::ptr::eq(*bt, st))
+            // Below a union without a whiteSpace facet, the raw value goes to
+            // the members and the one that accepts it normalizes it.
+            let own = effective_whitespace(st, schema)
+                .map(|ws| apply_whitespace_normalization(value, &ws));
+            let passed = own.as_deref().unwrap_or(value);
+            let from_base = if let Some(bt) =
+                resolve_simple_type(base, schema).filter(|bt| !std::ptr::eq(*bt, st))
             {
-                validate_simple_value(value, bt, context, schema, errors);
+                validate_simple_value(passed, bt, context, schema, errors)
             } else {
-                validate_builtin_value(value, base, context, errors);
-            }
-            validate_facets(value, facets, context, errors);
+                validate_builtin_value(passed, base, context, errors);
+                apply_whitespace_normalization(passed, &builtin_whitespace(base))
+            };
+            let value = own.unwrap_or(from_base);
+            validate_facets(&value, facets, context, errors);
+            value
         }
         SimpleTypeVariety::List { item_type } => {
             for item in value.split_whitespace() {
@@ -4383,17 +4395,17 @@ fn validate_simple_value(
                     validate_builtin_value(item, item_type, context, errors);
                 }
             }
+            apply_whitespace_normalization(value, &WhiteSpaceValue::Collapse)
         }
         SimpleTypeVariety::Union {
             member_types,
             inline_members,
-        } => {
-            validate_union_value(value, member_types, inline_members, context, schema, errors);
-        }
+        } => validate_union_value(value, member_types, inline_members, context, schema, errors),
     }
 }
 
-/// Validates a value against a union type.
+/// Validates a value against a union type and returns it as normalized by
+/// the first member that accepts it, else collapsed.
 fn validate_union_value(
     value: &str,
     member_types: &[String],
@@ -4401,31 +4413,27 @@ fn validate_union_value(
     context: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
-) {
-    let mut any_valid = false;
+) -> String {
     for mt in member_types {
         let mut trial = Vec::new();
-        if let Some(mst) = resolve_simple_type(mt, schema) {
-            validate_simple_value(value, mst, context, schema, &mut trial);
+        let normalized = if let Some(mst) = resolve_simple_type(mt, schema) {
+            validate_simple_value(value, mst, context, schema, &mut trial)
         } else {
             validate_builtin_value(value, mt, context, &mut trial);
-        }
+            apply_whitespace_normalization(value, &builtin_whitespace(mt))
+        };
         if trial.is_empty() {
-            any_valid = true;
-            break;
+            return normalized;
         }
     }
-    if !any_valid {
-        for mst in inline_members {
-            let mut trial = Vec::new();
-            validate_simple_value(value, mst, context, schema, &mut trial);
-            if trial.is_empty() {
-                any_valid = true;
-                break;
-            }
+    for mst in inline_members {
+        let mut trial = Vec::new();
+        let normalized = validate_simple_value(value, mst, context, schema, &mut trial);
+        if trial.is_empty() {
+            return normalized;
         }
     }
-    if !any_valid && (!member_types.is_empty() || !inline_members.is_empty()) {
+    if !member_types.is_empty() || !inline_members.is_empty() {
         errors.push(ValidationError {
             message: format!(
                 "value \"{value}\" in <{context}> does not match any member type of the union"
@@ -4434,6 +4442,7 @@ fn validate_union_value(
             column: None,
         });
     }
+    apply_whitespace_normalization(value, &WhiteSpaceValue::Collapse)
 }
 
 /// Validates a value against a built-in XSD type, after normalizing it by
@@ -4736,30 +4745,32 @@ fn apply_whitespace_normalization(value: &str, ws: &WhiteSpaceValue) -> String {
 /// The whiteSpace value in force for a type (XSD Part 2, 4.3.6): the
 /// nearest `whiteSpace` facet of its derivation chain, else the builtin's:
 /// `preserve` for `string`, `replace` for `normalizedString`, and the fixed
-/// `collapse` of every other builtin, list and union.
-fn effective_whitespace(st: &SimpleType, schema: &XsdSchema) -> WhiteSpaceValue {
+/// `collapse` of every other builtin and list. `None` below a union: there
+/// the member that accepts the value decides (XSD Part 2, 2.5.1.3).
+fn effective_whitespace(st: &SimpleType, schema: &XsdSchema) -> Option<WhiteSpaceValue> {
     let mut current = st;
     // A derivation chain longer than this is a cycle; `collapse` then is
     // as good a guess as any.
     for _ in 0..64 {
         match &current.variety {
-            SimpleTypeVariety::Builtin(name) => return builtin_whitespace(name),
+            SimpleTypeVariety::Builtin(name) => return Some(builtin_whitespace(name)),
             SimpleTypeVariety::Restriction { base, facets } => {
                 if let Some(ws) = facets.iter().find_map(|f| match f {
                     Facet::WhiteSpace(ws) => Some(ws),
                     _ => None,
                 }) {
-                    return ws.clone();
+                    return Some(ws.clone());
                 }
                 match resolve_simple_type(base, schema).filter(|bt| !std::ptr::eq(*bt, current)) {
                     Some(bt) => current = bt,
-                    None => return builtin_whitespace(base),
+                    None => return Some(builtin_whitespace(base)),
                 }
             }
-            SimpleTypeVariety::List { .. } | SimpleTypeVariety::Union { .. } => break,
+            SimpleTypeVariety::List { .. } => break,
+            SimpleTypeVariety::Union { .. } => return None,
         }
     }
-    WhiteSpaceValue::Collapse
+    Some(WhiteSpaceValue::Collapse)
 }
 
 /// The whiteSpace value of a builtin type (XSD Part 2, 4.3.6).
