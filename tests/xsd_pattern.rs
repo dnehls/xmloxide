@@ -149,3 +149,38 @@ fn patterns_in_one_step_are_ored() {
     assert_valid(t, "U", "aa");
     assert_invalid(t, "U", "bb");
 }
+
+/// Patterns apply to the value after the type's whiteSpace normalization
+/// (XSD Part 2, 4.3.6): `anyURI` inherits the fixed `collapse`, so `UomURI`
+/// accepts padding that `UomSymbol` (base `string`, `preserve`) rejects.
+#[test]
+fn pattern_sees_inherited_whitespace_collapse() {
+    for ok in [" urn:adv:uom:rad", "\n  urn:adv:uom:m\n"] {
+        assert_valid(UOM, "UomIdentifier", ok);
+        assert_valid(UOM, "UomURI", ok);
+    }
+    assert_invalid(UOM, "UomIdentifier", " m");
+}
+
+/// `string` preserves, `normalizedString` replaces, and a `whiteSpace`
+/// facet of an earlier derivation step carries over to later patterns.
+#[test]
+fn pattern_whitespace_follows_derivation_chain() {
+    let types = r#"<xs:simpleType name="S">
+    <xs:restriction base="xs:string"><xs:pattern value="[a-z]+"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="N">
+    <xs:restriction base="xs:normalizedString"><xs:pattern value="a b"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="C">
+    <xs:restriction base="xs:string"><xs:whiteSpace value="collapse"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="D">
+    <xs:restriction base="C"><xs:pattern value="[a-z]+"/></xs:restriction>
+  </xs:simpleType>"#;
+    assert_invalid(types, "S", " ab");
+    assert_valid(types, "N", "a&#9;b");
+    assert_invalid(types, "N", " a b");
+    assert_valid(types, "D", " ab ");
+    assert_invalid(types, "D", "a b");
+}

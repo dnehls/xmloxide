@@ -4354,6 +4354,7 @@ fn validate_simple_value(
     match &st.variety {
         SimpleTypeVariety::Builtin(name) => validate_builtin_value(value, name, context, errors),
         SimpleTypeVariety::Restriction { base, facets } => {
+            let value = &apply_whitespace_normalization(value, &effective_whitespace(st, schema));
             if let Some(bt) = resolve_simple_type(base, schema).filter(|bt| !std::ptr::eq(*bt, st))
             {
                 validate_simple_value(value, bt, context, schema, errors);
@@ -4703,30 +4704,54 @@ fn apply_whitespace_normalization(value: &str, ws: &WhiteSpaceValue) -> String {
     }
 }
 
-/// Validates facet constraints on a string value.
+/// The whiteSpace value in force for a type (XSD Part 2, 4.3.6): the
+/// nearest `whiteSpace` facet of its derivation chain, else the builtin's:
+/// `preserve` for `string`, `replace` for `normalizedString`, and the fixed
+/// `collapse` of every other builtin, list and union.
+fn effective_whitespace(st: &SimpleType, schema: &XsdSchema) -> WhiteSpaceValue {
+    let mut current = st;
+    // A derivation chain longer than this is a cycle; `collapse` then is
+    // as good a guess as any.
+    for _ in 0..64 {
+        match &current.variety {
+            SimpleTypeVariety::Builtin(name) => return builtin_whitespace(name),
+            SimpleTypeVariety::Restriction { base, facets } => {
+                if let Some(ws) = facets.iter().find_map(|f| match f {
+                    Facet::WhiteSpace(ws) => Some(ws),
+                    _ => None,
+                }) {
+                    return ws.clone();
+                }
+                match resolve_simple_type(base, schema).filter(|bt| !std::ptr::eq(*bt, current)) {
+                    Some(bt) => current = bt,
+                    None => return builtin_whitespace(base),
+                }
+            }
+            SimpleTypeVariety::List { .. } | SimpleTypeVariety::Union { .. } => break,
+        }
+    }
+    WhiteSpaceValue::Collapse
+}
+
+/// The whiteSpace value of a builtin type (XSD Part 2, 4.3.6).
+fn builtin_whitespace(name: &str) -> WhiteSpaceValue {
+    match name {
+        "string" | "anySimpleType" => WhiteSpaceValue::Preserve,
+        "normalizedString" => WhiteSpaceValue::Replace,
+        _ => WhiteSpaceValue::Collapse,
+    }
+}
+
+/// Validates facet constraints on a value that is already whiteSpace
+/// normalized for its type.
 fn validate_facets(
     value: &str,
     facets: &[Facet],
     context: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    // Find any WhiteSpace facet and normalize the value before checking other facets.
-    let normalized;
-    let effective_value = if let Some(ws) = facets.iter().find_map(|f| {
-        if let Facet::WhiteSpace(ws) = f {
-            Some(ws)
-        } else {
-            None
-        }
-    }) {
-        normalized = apply_whitespace_normalization(value, ws);
-        &normalized
-    } else {
-        value
-    };
-
     for facet in facets {
-        validate_single_facet(effective_value, facet, context, errors);
+        validate_single_facet(value, facet, context, errors);
     }
 
     // The patterns of one restriction step combine as branches of a single
@@ -4739,15 +4764,11 @@ fn validate_facets(
             _ => None,
         })
         .collect();
-    if !patterns.is_empty()
-        && !patterns
-            .iter()
-            .any(|p| matches_xsd_pattern(effective_value, p))
-    {
+    if !patterns.is_empty() && !patterns.iter().any(|p| matches_xsd_pattern(value, p)) {
         let pattern = patterns.join("|");
         errors.push(ValidationError {
             message: format!(
-                "value \"{effective_value}\" in <{context}> does not match pattern \"{pattern}\""
+                "value \"{value}\" in <{context}> does not match pattern \"{pattern}\""
             ),
             line: None,
             column: None,
