@@ -271,6 +271,8 @@ pub enum SimpleTypeVariety {
     Union {
         /// The member type names.
         member_types: Vec<String>,
+        /// Anonymous `<simpleType>` members, after `member_types`.
+        inline_members: Vec<SimpleType>,
     },
     /// A reference to a built-in type by name.
     Builtin(String),
@@ -2224,9 +2226,17 @@ fn parse_simple_type(doc: &Document, node: NodeId) -> SimpleType {
                     .map_or_else(Vec::new, |mt| {
                         mt.split_whitespace().map(strip_xs_prefix).collect()
                     });
+                let inline_members = doc
+                    .children(child)
+                    .filter(|&c| doc.node_name(c) == Some("simpleType"))
+                    .map(|c| parse_simple_type(doc, c))
+                    .collect();
                 return SimpleType {
                     name,
-                    variety: SimpleTypeVariety::Union { member_types },
+                    variety: SimpleTypeVariety::Union {
+                        member_types,
+                        inline_members,
+                    },
                 };
             }
             _ => {}
@@ -4374,8 +4384,11 @@ fn validate_simple_value(
                 }
             }
         }
-        SimpleTypeVariety::Union { member_types } => {
-            validate_union_value(value, member_types, context, schema, errors);
+        SimpleTypeVariety::Union {
+            member_types,
+            inline_members,
+        } => {
+            validate_union_value(value, member_types, inline_members, context, schema, errors);
         }
     }
 }
@@ -4384,6 +4397,7 @@ fn validate_simple_value(
 fn validate_union_value(
     value: &str,
     member_types: &[String],
+    inline_members: &[SimpleType],
     context: &str,
     schema: &XsdSchema,
     errors: &mut Vec<ValidationError>,
@@ -4401,7 +4415,17 @@ fn validate_union_value(
             break;
         }
     }
-    if !any_valid && !member_types.is_empty() {
+    if !any_valid {
+        for mst in inline_members {
+            let mut trial = Vec::new();
+            validate_simple_value(value, mst, context, schema, &mut trial);
+            if trial.is_empty() {
+                any_valid = true;
+                break;
+            }
+        }
+    }
+    if !any_valid && (!member_types.is_empty() || !inline_members.is_empty()) {
         errors.push(ValidationError {
             message: format!(
                 "value \"{value}\" in <{context}> does not match any member type of the union"
