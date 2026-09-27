@@ -259,6 +259,9 @@ pub enum SimpleTypeVariety {
     Restriction {
         /// The base type name being restricted.
         base: String,
+        /// The anonymous `<simpleType>` base, which takes the place of
+        /// `base` when present.
+        inline_base: Option<Box<SimpleType>>,
         /// Facets that further constrain the value space.
         facets: Vec<Facet>,
     },
@@ -266,6 +269,9 @@ pub enum SimpleTypeVariety {
     List {
         /// The name of the type for list items.
         item_type: String,
+        /// The anonymous `<simpleType>` item type, which takes the place of
+        /// `item_type` when present.
+        inline_item: Option<Box<SimpleType>>,
     },
     /// A union of multiple simple types.
     Union {
@@ -2193,6 +2199,14 @@ fn parse_simple_content(doc: &Document, node: NodeId) -> ComplexContent {
     ComplexContent::Empty
 }
 
+/// Parses the anonymous `<xs:simpleType>` child of a `<restriction>` or
+/// `<list>` (REC-xmlschema-2-20041028 4.1.2).
+fn inline_simple_type(doc: &Document, node: NodeId) -> Option<Box<SimpleType>> {
+    doc.children(node)
+        .find(|&c| doc.node_name(c) == Some("simpleType"))
+        .map(|c| Box::new(parse_simple_type(doc, c)))
+}
+
 /// Parses an `<xs:simpleType>` element.
 fn parse_simple_type(doc: &Document, node: NodeId) -> SimpleType {
     let name = doc.attribute(node, "name").map(String::from);
@@ -2205,19 +2219,28 @@ fn parse_simple_type(doc: &Document, node: NodeId) -> SimpleType {
                 let base = doc
                     .attribute(child, "base")
                     .map_or_else(|| "string".to_string(), strip_xs_prefix);
+                let inline_base = inline_simple_type(doc, child);
                 let facets = parse_facets(doc, child);
                 return SimpleType {
                     name,
-                    variety: SimpleTypeVariety::Restriction { base, facets },
+                    variety: SimpleTypeVariety::Restriction {
+                        base,
+                        inline_base,
+                        facets,
+                    },
                 };
             }
             "list" => {
                 let item_type = doc
                     .attribute(child, "itemType")
                     .map_or_else(|| "string".to_string(), strip_xs_prefix);
+                let inline_item = inline_simple_type(doc, child);
                 return SimpleType {
                     name,
-                    variety: SimpleTypeVariety::List { item_type },
+                    variety: SimpleTypeVariety::List {
+                        item_type,
+                        inline_item,
+                    },
                 };
             }
             "union" => {
@@ -4375,14 +4398,19 @@ fn validate_simple_value(
             validate_builtin_value(value, name, context, errors);
             apply_whitespace_normalization(value, &builtin_whitespace(name))
         }
-        SimpleTypeVariety::Restriction { base, facets } => {
+        SimpleTypeVariety::Restriction {
+            base,
+            inline_base,
+            facets,
+        } => {
             // Below a union without a whiteSpace facet, the raw value goes to
             // the members and the one that accepts it normalizes it.
             let own = effective_whitespace(st, schema)
                 .map(|ws| apply_whitespace_normalization(value, &ws));
             let passed = own.as_deref().unwrap_or(value);
-            let from_base = if let Some(bt) =
-                resolve_simple_type(base, schema).filter(|bt| !std::ptr::eq(*bt, st))
+            let from_base = if let Some(bt) = inline_base
+                .as_deref()
+                .or_else(|| resolve_simple_type(base, schema).filter(|bt| !std::ptr::eq(*bt, st)))
             {
                 validate_simple_value(passed, bt, context, schema, errors)
             } else {
@@ -4393,11 +4421,14 @@ fn validate_simple_value(
             validate_facets(&value, facets, context, errors);
             value
         }
-        SimpleTypeVariety::List { item_type } => {
+        SimpleTypeVariety::List {
+            item_type,
+            inline_item,
+        } => {
             for item in value.split_whitespace() {
-                if let Some(ist) =
+                if let Some(ist) = inline_item.as_deref().or_else(|| {
                     resolve_simple_type(item_type, schema).filter(|ist| !std::ptr::eq(*ist, st))
-                {
+                }) {
                     validate_simple_value(item, ist, context, schema, errors);
                 } else {
                     validate_builtin_value(item, item_type, context, errors);
@@ -4762,14 +4793,20 @@ fn effective_whitespace(st: &SimpleType, schema: &XsdSchema) -> Option<WhiteSpac
     for _ in 0..64 {
         match &current.variety {
             SimpleTypeVariety::Builtin(name) => return Some(builtin_whitespace(name)),
-            SimpleTypeVariety::Restriction { base, facets } => {
+            SimpleTypeVariety::Restriction {
+                base,
+                inline_base,
+                facets,
+            } => {
                 if let Some(ws) = facets.iter().find_map(|f| match f {
                     Facet::WhiteSpace(ws) => Some(ws),
                     _ => None,
                 }) {
                     return Some(ws.clone());
                 }
-                match resolve_simple_type(base, schema).filter(|bt| !std::ptr::eq(*bt, current)) {
+                match inline_base.as_deref().or_else(|| {
+                    resolve_simple_type(base, schema).filter(|bt| !std::ptr::eq(*bt, current))
+                }) {
                     Some(bt) => current = bt,
                     None => return Some(builtin_whitespace(base)),
                 }
