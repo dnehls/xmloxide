@@ -397,6 +397,8 @@ pub enum ComplexContent {
     SimpleContent {
         /// The base type name.
         base: String,
+        /// Namespace of the base type, resolved where the type is declared.
+        base_namespace: Option<String>,
     },
 }
 
@@ -1531,13 +1533,19 @@ fn find_complex_type_by_key<'a>(key: &TypeKey, schema: &'a XsdSchema) -> Option<
     let Some(ns) = ns.as_deref() else {
         return find_complex_type(local, schema);
     };
-    let own = (schema.target_namespace.as_deref() == Some(ns))
-        .then(|| schema.types.get(local))
-        .flatten();
-    match own.or_else(|| schema.imported_namespaces.get(ns)?.types.get(local)) {
+    match find_type_in_namespace(ns, local, schema) {
         Some(XsdType::Complex(ct)) => Some(ct),
         _ => None,
     }
+}
+
+/// Looks up a type by namespace and local name, see
+/// [`find_complex_type_by_key`].
+fn find_type_in_namespace<'a>(ns: &str, local: &str, schema: &'a XsdSchema) -> Option<&'a XsdType> {
+    let own = (schema.target_namespace.as_deref() == Some(ns))
+        .then(|| schema.types.get(local))
+        .flatten();
+    own.or_else(|| schema.imported_namespaces.get(ns)?.types.get(local))
 }
 
 /// Looks up a complex type by local name, checking local types and
@@ -1843,7 +1851,7 @@ fn parse_complex_type(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> Co
                 }
             }
             "simpleContent" => {
-                content = parse_simple_content(doc, child);
+                content = parse_simple_content(doc, child, ctx);
                 collect_simple_content_attributes(doc, child, &mut attributes);
             }
             "complexContent" => {
@@ -2186,12 +2194,13 @@ fn parse_max_occurs(doc: &Document, node: NodeId) -> MaxOccurs {
 }
 
 /// Parses `<xs:simpleContent>` within a complex type.
-fn parse_simple_content(doc: &Document, node: NodeId) -> ComplexContent {
+fn parse_simple_content(doc: &Document, node: NodeId, ctx: &DeclContext<'_>) -> ComplexContent {
     for child in doc.children(node) {
         if matches!(doc.node_name(child), Some("extension" | "restriction")) {
             if let Some(base) = doc.attribute(child, "base") {
                 return ComplexContent::SimpleContent {
                     base: strip_xs_prefix(base),
+                    base_namespace: qname_namespace(doc, child, base, ctx),
                 };
             }
         }
@@ -2742,7 +2751,7 @@ fn declares_any_type(decl: &XsdElement, schema: &XsdSchema) -> bool {
 /// followed by its own. complexContent derivation is merged at load time.
 fn effective_attributes(ct: &ComplexType, schema: &XsdSchema) -> Vec<XsdAttribute> {
     let mut attrs = match &ct.content {
-        ComplexContent::SimpleContent { base } => {
+        ComplexContent::SimpleContent { base, .. } => {
             resolve_simple_content_base_attributes(base, schema)
         }
         _ => Vec::new(),
@@ -2777,7 +2786,7 @@ fn resolve_simple_content_base_attributes_impl(
 
     match ty {
         XsdType::Complex(ct) => {
-            let mut attrs = if let ComplexContent::SimpleContent { base } = &ct.content {
+            let mut attrs = if let ComplexContent::SimpleContent { base, .. } = &ct.content {
                 resolve_simple_content_base_attributes_impl(base, schema, visited)
             } else {
                 Vec::new()
@@ -2899,17 +2908,8 @@ fn validate_complex_element_strict(
                 true,
             );
         }
-        ComplexContent::SimpleContent { base } => {
-            let text = doc.text_content(node);
-            if let Some(st) = resolve_simple_type(base, schema) {
-                validate_simple_value(
-                    &text,
-                    st,
-                    doc.node_name(node).unwrap_or("<unknown>"),
-                    schema,
-                    errors,
-                );
-            }
+        ComplexContent::SimpleContent { .. } => {
+            validate_simple_content(doc, node, ct, schema, errors);
         }
     }
 }
@@ -3297,11 +3297,58 @@ fn validate_complex_element(
             let ce = collect_child_elements(doc, node);
             validate_all(doc, &ce, p, elem_name, schema, errors, false);
         }
-        ComplexContent::SimpleContent { base } => {
-            let text = doc.text_content(node);
-            if let Some(st) = resolve_simple_type(base, schema) {
-                validate_simple_value(&text, st, elem_name, schema, errors);
-            }
+        ComplexContent::SimpleContent { .. } => {
+            validate_simple_content(doc, node, ct, schema, errors);
+        }
+    }
+}
+
+/// Validates the text of an element with simpleContent against the simple
+/// type its type derives from.
+fn validate_simple_content(
+    doc: &Document,
+    node: NodeId,
+    ct: &ComplexType,
+    schema: &XsdSchema,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(st) = simple_content_type(ct, schema) {
+        let elem_name = doc.node_name(node).unwrap_or("<unknown>");
+        validate_simple_value(&doc.text_content(node), st, elem_name, schema, errors);
+    }
+}
+
+/// The simple type `ct` derives from by simpleContent, possibly through
+/// other complex types (XSD 1.0 Part 1, 3.4.2, {content type}).
+///
+/// Returns `None` if a base is unknown or the derivation is circular.
+/// Facets of a simpleContent restriction are not modelled.
+fn simple_content_type<'a>(
+    mut ct: &'a ComplexType,
+    schema: &'a XsdSchema,
+) -> Option<&'a SimpleType> {
+    let mut visited: Vec<&ComplexType> = Vec::new();
+    loop {
+        if visited.iter().any(|seen| std::ptr::eq(*seen, ct)) {
+            return None;
+        }
+        visited.push(ct);
+        let ComplexContent::SimpleContent {
+            base,
+            base_namespace,
+        } = &ct.content
+        else {
+            return None;
+        };
+        let local = base.split_once(':').map_or(base.as_str(), |(_, l)| l);
+        let base_type = match base_namespace.as_deref() {
+            Some(XSD_NAMESPACE) => schema.types.get(local),
+            Some(ns) => find_type_in_namespace(ns, local, schema),
+            None => resolve_type_name(base, schema),
+        };
+        match base_type? {
+            XsdType::Simple(st) => return Some(st),
+            XsdType::Complex(base_ct) => ct = base_ct,
         }
     }
 }
